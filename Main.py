@@ -294,6 +294,7 @@ class MainWindow(QMainWindow):
 
     def export_lrc(self):
         folder = self._get_active_folder()
+        print(self._get_active_folder())
         if not folder:
             QMessageBox.warning(self, "No Folder Loaded", "Please load a folder before exporting.")
             return
@@ -314,7 +315,7 @@ class MainWindow(QMainWindow):
             "version": LRC_VERSION,
             "created_utc": datetime.utcnow().isoformat() + "Z",
             "folder_path": os.path.abspath(folder),
-            "current_image": current_rel,
+            "current_image": os.path.abspath(folder),
             "edits": edits_rel
             }
         path, _ = QFileDialog.getSaveFileName(self, "Export Project", os.path.join(folder, "project.lrc"), "Lightroom Clone Project (*.lrc)")
@@ -346,7 +347,7 @@ class MainWindow(QMainWindow):
         if not folder_abs or not os.path.isdir(folder_abs):
             QMessageBox.critical(self, "Import Failed", "Project folder does not exist.")
             return
-        self.load_folder(folder_abs)
+        self.load_folder(data.get("folder_path"))
 
         imported_edits = data.get("edits", {})
         for rel_path, params in imported_edits.items():
