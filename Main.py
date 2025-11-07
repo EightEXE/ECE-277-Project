@@ -1,11 +1,27 @@
-from PySide6.QtWidgets import QApplication, QMainWindow, QWidget, QVBoxLayout, QLabel, QListWidget, QWidgetItem, QListWidgetItem, QScrollArea, QFileDialog, QStatusBar, QListView, QSizePolicy, QLayout, QAbstractItemView, QStyle, QDockWidget, QSlider, QHBoxLayout
+from PySide6.QtWidgets import QApplication, QMainWindow, QWidget, QVBoxLayout, QLabel, QListWidget, QWidgetItem, QListWidgetItem, QScrollArea, QFileDialog, QStatusBar, QListView, QSizePolicy, QLayout, QAbstractItemView, QStyle, QDockWidget, QSlider, QHBoxLayout, QMessageBox
 from PySide6.QtCore import Qt, QSize, QRunnable, QThreadPool, Signal, QObject, QPoint
 from PySide6.QtGui import QPixmap, QIcon, QImageReader, QFontMetrics
-import sys
+import sys, time
 from qt_material import apply_stylesheet
 import os
+import json
+from datetime import datetime
+
 
 IMage_EXTENSIONS = ['.png', '.jpg', '.jpeg', '.bmp', '.gif']
+LRC_VERSION = "1.0"
+
+def _relpath_or_same(path: str, start: str) -> str:
+    try:
+        return os.path.relpath(path, start)
+    except Exception:
+        return path
+    
+def _abspath_from_base(maybe_rel: str, base: str) -> str:
+    if os.path.isabs(maybe_rel):
+        return maybe_rel
+    return os.path.abspath(os.path.join(base, maybe_rel))
+
 
 class _WorkerSignals(QObject):
     ready = Signal(str, QIcon)
@@ -41,6 +57,14 @@ class MainWindow(QMainWindow):
         self.vbox = QVBoxLayout(central)
         self.vbox.setContentsMargins(8,8,8,8)
         self.vbox.setSpacing(8)
+
+
+        self.current_folder = None
+        self._current_path = None
+        self._edits = {}
+        
+
+    
 
 
         #large image aera
@@ -106,6 +130,16 @@ class MainWindow(QMainWindow):
         self._placeholder_icon = QIcon(QPixmap(icon_w, icon_h))
         self._current_pixmap = None
 
+        file_menu.addSeparator()
+        self.act_export = file_menu.addAction("&Save File... (.lrc)")
+        self.act_export.setShortcut("Ctrl+S")
+        self.act_export.triggered.connect(self.export_lrc)
+        
+        self.act_import = file_menu.addAction("&Import File... (.lrc)")
+        self.act_import.setShortcut("Ctrl+I")
+        self.act_import.triggered.connect(self.import_project)
+        
+
          # saturation slider
         self.saturation_slider = QSlider(Qt.Horizontal)
         self.saturation_slider.setRange(0, 255)
@@ -132,6 +166,8 @@ class MainWindow(QMainWindow):
 
         self.addDockWidget(Qt.RightDockWidgetArea, sidebar_dock)
 
+        
+
 
    
 
@@ -145,6 +181,7 @@ class MainWindow(QMainWindow):
 
     def display_image(self, item):
         path = item.data(Qt.UserRole)
+        self._current_path = path
         pm = QPixmap(path)
         if pm.isNull():
             return
@@ -208,6 +245,7 @@ class MainWindow(QMainWindow):
         self._icon_cache.clear()
         self._loading.clear()
         self._item_for_path.clear()
+        self._current_folder = folder_path
         count = 0
         for name in sorted(os.listdir(folder_path)):
             path = os.path.join(folder_path, name)
@@ -229,11 +267,105 @@ class MainWindow(QMainWindow):
             self.display_image(self.thumbs.item(0))
         self._ensure_visible_thumbs()
 
+        self.statusBar().showMessage(f"Loaded {count} images from {folder_path}")
+
     def resizeEvent(self, event):
         super().resizeEvent(event)
         if getattr(self, '_current_pixmap', None) is not None:
             self._rescale_preview()
         self._ensure_visible_thumbs()
+
+
+    def _get_active_folder(self):
+        folder = getattr(self, "_current_folder", None)
+        if folder and os.path.isdir(folder):
+            return folder
+        p = getattr(self, "_current_path", None)
+        if p and os.path.isfile(p):
+            return os.path.dirname(p)
+        it = self.thumbs.currentItem()
+        if it:
+            p = it.data(Qt.UserRole)
+            if p and os.path.isfile(p):
+                return os.path.dirname(p)
+        return None
+
+    #custom export format .lrc
+
+    def export_lrc(self):
+        folder = self._get_active_folder()
+        if not folder:
+            QMessageBox.warning(self, "No Folder Loaded", "Please load a folder before exporting.")
+            return
+        folder = self._current_path
+        current_rel = _relpath_or_same(self._current_path or "", folder)
+
+        edits_rel = {}
+        for abs_path, params in self._edits.items():
+            try:
+                if os.path.commonpath([abs_path, folder]) != folder:
+                    continue
+            except Exception:
+                continue
+            edits_rel[_relpath_or_same(abs_path, folder)] = dict(params)
+
+        data = {
+            "schema": "ECE 277 LightRoom Project",
+            "version": LRC_VERSION,
+            "created_utc": datetime.utcnow().isoformat() + "Z",
+            "folder_path": os.path.abspath(folder),
+            "current_image": current_rel,
+            "edits": edits_rel
+            }
+        path, _ = QFileDialog.getSaveFileName(self, "Export Project", os.path.join(folder, "project.lrc"), "Lightroom Clone Project (*.lrc)")
+        if not path:
+            return
+        if not path.lower().endswith('.lrc'):
+            path += '.lrc'
+        try:
+            with open(path, "w" , encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+            self.statusBar().showMessage(f"Exported project to {path}")
+        except Exception as e:
+            QMessageBox.critical(self, "Export Failed", f"Failed to export project: {e}")
+
+    def import_project(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Import Project", os.path.expanduser("~"), "Lightroom Clone Project (*.lrc)")
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception as e:
+            QMessageBox.critical(self, "Import Failed", f"Failed to import project: {e}")
+            return
+        if data.get("schema") != "ECE 277 LightRoom Project":
+            QMessageBox.critical(self, "Import Failed", "Invalid project file.")
+            return
+        folder_abs = data.get("folder_path")
+        if not folder_abs or not os.path.isdir(folder_abs):
+            QMessageBox.critical(self, "Import Failed", "Project folder does not exist.")
+            return
+        self.load_folder(folder_abs)
+
+        imported_edits = data.get("edits", {})
+        for rel_path, params in imported_edits.items():
+            abs_path = _abspath_from_base(rel_path, folder_abs)
+            self._edits[abs_path] = dict(params)
+        current_rel = data.get("current_image", "")
+        current_abs = _abspath_from_base(current_rel, folder_abs)
+        if os.path.isfile(current_abs):
+            it = self._item_for_path.get(current_abs)
+            if it is not None:
+                self.thumbs.setCurrentItem(it)
+                self.current_path = it.data(Qt.UserRole)
+                self.display_image(it)
+        self.statusBar().showMessage
+
+       
+        
+
+
         
 
 if __name__ == "__main__":
