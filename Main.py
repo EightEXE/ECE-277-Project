@@ -1,6 +1,9 @@
 from PySide6.QtWidgets import QApplication, QMainWindow, QWidget, QVBoxLayout, QLabel, QListWidget, QWidgetItem, QListWidgetItem, QScrollArea, QFileDialog, QStatusBar, QListView, QSizePolicy, QLayout, QAbstractItemView, QStyle, QDockWidget, QSlider, QHBoxLayout, QMessageBox
 from PySide6.QtCore import Qt, QSize, QRunnable, QThreadPool, Signal, QObject, QPoint
 from PySide6.QtGui import QPixmap, QIcon, QImageReader, QFontMetrics
+from PySide6.QtQuickControls2 import QQuickStyle
+from PySide6.QtQml import QQmlApplicationEngine
+from PySide6.QtWidgets import QApplication
 import sys, time
 from qt_material import apply_stylesheet
 import os
@@ -48,8 +51,10 @@ class _ThumbTask(QRunnable):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-
-        self.setWindowTitle("LightRoom")
+        
+        self.setWindowTitle("LightRoom Clone")
+        self.setWindowIcon(QIcon("icon.ico"))
+        self.setIconSize(QSize(500, 500))
         self.resize(1200, 800)
         self.setMinimumSize(600, 400)
         central = QWidget(self)
@@ -165,19 +170,12 @@ class MainWindow(QMainWindow):
         sidebar_dock.setWidget(sidebar_content)
 
         self.addDockWidget(Qt.RightDockWidgetArea, sidebar_dock)
-
-        
-
-
-   
-
-
     def get_natural_pixmap(self, path: str) -> QPixmap:
         reader = QImageReader(path)
         reader.setAutoTransform(True)
         image = reader.read()
         pm = QPixmap(path)
-        return pm.fromImage(image)
+        return pm.fromImage(image) if not image.isNull() else QPixmap()
 
     def display_image(self, item):
         path = item.data(Qt.UserRole)
@@ -298,13 +296,12 @@ class MainWindow(QMainWindow):
         if not folder:
             QMessageBox.warning(self, "No Folder Loaded", "Please load a folder before exporting.")
             return
-        folder = self._current_path
         current_rel = _relpath_or_same(self._current_path or "", folder)
 
         edits_rel = {}
         for abs_path, params in self._edits.items():
             try:
-                if os.path.commonpath([abs_path, folder]) != folder:
+                if os.path.commonpath([os.path.abspath(abs_path), os.path.abspath(folder)]) != os.path.abspath(folder):
                     continue
             except Exception:
                 continue
@@ -315,7 +312,7 @@ class MainWindow(QMainWindow):
             "version": LRC_VERSION,
             "created_utc": datetime.utcnow().isoformat() + "Z",
             "folder_path": os.path.abspath(folder),
-            "current_image": os.path.abspath(folder),
+            "current_image": current_rel,
             "edits": edits_rel
             }
         path, _ = QFileDialog.getSaveFileName(self, "Export Project", os.path.join(folder, "project.lrc"), "Lightroom Clone Project (*.lrc)")
@@ -359,19 +356,20 @@ class MainWindow(QMainWindow):
             it = self._item_for_path.get(current_abs)
             if it is not None:
                 self.thumbs.setCurrentItem(it)
-                self.current_path = it.data(Qt.UserRole)
+                self._current_path = it.data(Qt.UserRole)
                 self.display_image(it)
-        self.statusBar().showMessage
+        self.statusBar().showMessage(f"Imported project from {path}")
 
        
-        
 
 
-        
+
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
-    apply_stylesheet(app, theme='dark_cyan.xml')
+    QQuickStyle.setStyle("macOS")
+    engine = QQmlApplicationEngine()
+    engine.load("main.qml")
     window = MainWindow()
     window.show()
     sys.exit(app.exec())
