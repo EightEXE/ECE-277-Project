@@ -9,8 +9,10 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QLabel, QListWidget,
     QListWidgetItem, QFileDialog, QStatusBar, QListView, QSizePolicy, QLayout,
     QAbstractItemView, QStyle, QDockWidget, QSlider, QHBoxLayout, QMessageBox,
-    QTreeWidget, QTreeWidgetItem, QDialog, QFormLayout, QSpinBox, QDialogButtonBox
+    QTreeWidget, QTreeWidgetItem, QDialog, QFormLayout, QSpinBox, QDialogButtonBox,
+    QMenu
 )
+
 from PySide6.QtCore import Qt, QSize, QRunnable, QThreadPool, Signal, QObject, QPoint, QTimer
 
 from PySide6.QtGui import (
@@ -145,6 +147,8 @@ class MainWindow(QMainWindow):
         self.thumbs.horizontalScrollBar().valueChanged.connect(
             lambda _: self._ensure_visible_thumbs()
         )
+        self.thumbs.verticalScrollBar().valueChanged.connect(
+            lambda _: self._ensure_visible_thumbs())
 
         icon_w = self.thumbs.iconSize().width()
         icon_h = self.thumbs.iconSize().height()
@@ -162,7 +166,7 @@ class MainWindow(QMainWindow):
 
         self.thumbs.setResizeMode(QListView.Fixed)
         self.thumbs.setHorizontalScrollMode(QAbstractItemView.ScrollPerPixel)
-        self.thumbs.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
+        self.thumbs.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
 
         self.setStatusBar(QStatusBar(self))
 
@@ -259,7 +263,7 @@ class MainWindow(QMainWindow):
         self.right_dock.setWidget(sidebar_content)
 
         # ---------- Left dock: Edit tree ----------
-        self.left_dock = QDockWidget("Edit History", self)
+        self.left_dock = QDockWidget("Active Edit", self)
         self.left_dock.setObjectName("leftSidebar")
         self.left_dock.setAllowedAreas(Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea)
         self.left_dock.setFeatures(
@@ -271,7 +275,7 @@ class MainWindow(QMainWindow):
         lSidebar_content = QWidget()
         lSidebar_layout = QVBoxLayout(lSidebar_content)
 
-        history_label = QLabel("Edit History")
+        history_label = QLabel("Active Edit")
         history_label.setObjectName("historyLabel")
 
         self.history_tree = QTreeWidget()
@@ -280,9 +284,18 @@ class MainWindow(QMainWindow):
         self.history_tree.setIconSize(QSize(64, 64))
         self.history_tree.itemClicked.connect(self._on_history_item_clicked)
 
+                # Right-click menu on Active Edit items
+        self.history_tree.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.history_tree.customContextMenuRequested.connect(
+            self._on_history_context_menu
+        )
+
+
         lSidebar_layout.addWidget(history_label)
         lSidebar_layout.addWidget(self.history_tree, 1)
         self.left_dock.setWidget(lSidebar_content)
+
+
 
         # ---------- Filmstrip dock ----------
         self.filmstrip_dock = QDockWidget("Filmstrip", self)
@@ -299,6 +312,16 @@ class MainWindow(QMainWindow):
         self.addDockWidget(Qt.LeftDockWidgetArea, self.left_dock)
         self.addDockWidget(Qt.RightDockWidgetArea, self.right_dock)
         self.addDockWidget(Qt.BottomDockWidgetArea, self.filmstrip_dock)
+
+                # Set initial orientation based on starting dock area
+        self._update_filmstrip_orientation(self.dockWidgetArea(self.filmstrip_dock))
+
+        # Update orientation whenever the dock is moved
+        self.filmstrip_dock.dockLocationChanged.connect(
+        self._on_filmstrip_location_changed
+        )
+
+
 
         # ---------- Window menu: toggles & layout ----------
         window_menu = self.menuBar().addMenu("&Window")
@@ -339,6 +362,98 @@ class MainWindow(QMainWindow):
         # Save the default layout so we can restore it later
         self._default_layout_state = self.saveState()
 
+        self._copied_params = None
+
+    def _on_history_context_menu(self, pos: QPoint):
+        """Show context menu for Active Edit items."""
+        item = self.history_tree.itemAt(pos)
+        if not item:
+            return
+
+        data = item.data(0, Qt.UserRole) or {}
+        path = data.get("path")
+        params = data.get("params", {})
+
+        if not path:
+            return
+
+        # Is this the top-level parent (Active Edit) entry?
+        is_parent = (self._image_parents.get(path) is item)
+
+        menu = QMenu(self)
+        act_copy = menu.addAction("Copy Values")
+        act_paste = menu.addAction("Paste Values")
+
+        act_remove = None
+        if is_parent:
+            menu.addSeparator()
+            act_remove = menu.addAction("Remove From Active Edit")
+
+        chosen = menu.exec(self.history_tree.viewport().mapToGlobal(pos))
+        if chosen is act_copy:
+            # Copy whatever params are on this specific item (parent or child)
+            self._copy_active_edit(path, params)
+        elif chosen is act_paste:
+            self._paste_active_edit(path)
+        elif act_remove is not None and chosen is act_remove:
+            self._remove_active_edit_image(path)
+
+
+    def _copy_active_edit(self, path: str, params: dict):
+        """Copy the params for this tree item (parent or child) into a buffer."""
+        if not params:
+            self._copied_params = {}
+        else:
+            self._copied_params = dict(params)
+
+        self.statusBar().showMessage(
+            f"Copied values for {os.path.basename(path)}", 2000
+        )
+
+    def _paste_active_edit(self, path: str):
+        """Paste previously copied params onto this image."""
+        if self._copied_params is None:
+            self.statusBar().showMessage("Nothing to paste (no Active Edit copied yet).", 2000)
+            return
+
+        self._image_params[path] = dict(self._copied_params)
+        self._edits[path] = dict(self._copied_params)
+
+        # Update preview and tree
+        self._show_image_version(path, self._copied_params, update_sliders=True)
+        self._update_history_for_current_image()
+
+        # autosave if project already has a file
+        self.export_lrc(autosave=True)
+
+        self.statusBar().showMessage(
+            f"Pasted Active Edit values to {os.path.basename(path)}", 2000
+        )
+
+    def _remove_active_edit_image(self, path: str):
+        """Remove this image from the Active Edit list entirely."""
+        self._image_params.pop(path, None)
+        self._edits.pop(path, None)
+
+        parent_item = self._image_parents.pop(path, None)
+        if parent_item is not None:
+            idx = self.history_tree.indexOfTopLevelItem(parent_item)
+            if idx >= 0:
+                self.history_tree.takeTopLevelItem(idx)
+
+        # Optionally revert preview to original if it's the current image
+        if self._current_path == path:
+            self._show_image_version(path, {}, update_sliders=True)
+
+        # autosave updated project if we have a file
+        self.export_lrc(autosave=True)
+
+        self.statusBar().showMessage(
+            f"Removed {os.path.basename(path)} from Active Edit.", 2000
+        )
+
+
+
     def _update_autosave_timer(self):
         """Start/stop the autosave QTimer based on the current interval."""
         if self._autosave_interval_min is None or self._autosave_interval_min <= 0:
@@ -347,6 +462,55 @@ class MainWindow(QMainWindow):
 
         interval_ms = int(self._autosave_interval_min * 60_000)
         self._autosave_timer.start(interval_ms)
+
+    def _on_filmstrip_location_changed(self, area: Qt.DockWidgetArea):
+        """Called when the filmstrip dock is moved to a new area."""
+        self._update_filmstrip_orientation(area)
+        self._ensure_visible_thumbs()
+
+
+
+    def _update_filmstrip_orientation(self, area: Qt.DockWidgetArea):
+        """Switch thumbnail layout based on where the dock is placed."""
+        vertical = area in (Qt.LeftDockWidgetArea, Qt.RightDockWidgetArea)
+
+        icon_w = self.thumbs.iconSize().width()
+        icon_h = self.thumbs.iconSize().height()
+        fm = QFontMetrics(self.thumbs.font())
+        text_h = fm.height()
+        pad_h = 8
+        cell_w = icon_w + 16
+        cell_h = icon_h + text_h + pad_h
+        sb_size = self.style().pixelMetric(QStyle.PM_ScrollBarExtent)
+
+        if vertical:
+            # Single column, scroll vertically
+            self.thumbs.setFlow(QListView.TopToBottom)
+            self.thumbs.setWrapping(False)
+            self.thumbs.setViewMode(QListWidget.IconMode)
+
+            self.thumbs.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+            self.thumbs.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
+
+            # grid is still useful for consistent spacing
+            self.thumbs.setGridSize(QSize(cell_w, cell_h))
+
+            # make it easier to resize as a side dock
+            self.thumbs.setMinimumWidth(cell_w + sb_size + 2)
+            self.thumbs.setMinimumHeight(0)
+        else:
+            # Horizontal filmstrip, scroll horizontally
+            self.thumbs.setFlow(QListView.LeftToRight)
+            self.thumbs.setWrapping(False)
+            self.thumbs.setViewMode(QListWidget.IconMode)
+
+            self.thumbs.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
+            self.thumbs.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+
+            self.thumbs.setGridSize(QSize(cell_w, cell_h))
+            self.thumbs.setMinimumHeight(cell_h + sb_size + 2)
+            self.thumbs.setMinimumWidth(0)
+
 
     def _on_autosave_timer(self):
         """Timer callback: autosave only if project has already been saved."""
@@ -1122,12 +1286,13 @@ class MainWindow(QMainWindow):
     def import_project(self):
         path, _ = QFileDialog.getOpenFileName(
             self,
-            "Import Project",
+            "Open Project",
             os.path.expanduser("~"),
             "Lightroom Clone Project (*.lrc)",
         )
         if not path:
             return
+
         try:
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
@@ -1165,23 +1330,21 @@ class MainWindow(QMainWindow):
         current_abs = _abspath_from_base(current_rel, folder_abs) if current_rel else None
 
         if current_abs and os.path.isfile(current_abs):
-            # select thumbnail if present
             thumb_item = self._item_for_path.get(current_abs)
             if thumb_item is not None:
                 self.thumbs.setCurrentItem(thumb_item)
-
             params = self._image_params.get(current_abs, {})
             self._show_image_version(current_abs, params, update_sliders=True)
-
-            # select parent node (Active Edit) in the tree
             parent = self._image_parents.get(current_abs)
             if parent is not None:
                 self.history_tree.setCurrentItem(parent)
-        else:
-            # no current image in file – just leave whatever load_folder showed
-            pass
+
+        # THIS is what autosave depends on
+        self._project_path = os.path.abspath(path)
+        print(f"[IMPORT] Project path set to: {self._project_path}")
 
         self.statusBar().showMessage(f"Imported project from {path}")
+
 
     def import_project_from_path(self, path: str):
         """Load .lrc project without a QFileDialog (used when opening from OS)."""
@@ -1215,15 +1378,20 @@ class MainWindow(QMainWindow):
         self._rebuild_history_from_params()
 
         current_rel = data.get("current_image", "")
-        current_abs = _abspath_from_base(current_rel, folder_abs)
+        current_abs = _abspath_from_base(current_rel, folder_abs) if current_rel else None
 
-        if os.path.isfile(current_abs):
+        if current_abs and os.path.isfile(current_abs):
             it = self._item_for_path.get(current_abs)
             if it:
                 self.thumbs.setCurrentItem(it)
                 self._on_thumbnail_clicked(it)
 
+        #  Again: tell autosave what file to use
+        self._project_path = os.path.abspath(path)
+        print(f"[IMPORT FROM PATH] Project path set to: {self._project_path}")
+
         self.statusBar().showMessage(f"Imported project from {path}")
+
 
 
 if __name__ == "__main__":
