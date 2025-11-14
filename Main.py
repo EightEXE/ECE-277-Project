@@ -1,6 +1,6 @@
 from PySide6.QtWidgets import QApplication, QMainWindow, QWidget, QVBoxLayout, QLabel, QListWidget, QWidgetItem, QListWidgetItem, QScrollArea, QFileDialog, QStatusBar, QListView, QSizePolicy, QLayout, QAbstractItemView, QStyle, QDockWidget, QSlider, QHBoxLayout, QMessageBox
 from PySide6.QtCore import Qt, QSize, QRunnable, QThreadPool, Signal, QObject, QPoint
-from PySide6.QtGui import QPixmap, QIcon, QImageReader, QFontMetrics
+from PySide6.QtGui import QPixmap, QIcon, QImageReader, QFontMetrics, QImage
 from PySide6.QtQuickControls2 import QQuickStyle
 from PySide6.QtQml import QQmlApplicationEngine
 from PySide6.QtWidgets import QApplication
@@ -68,10 +68,6 @@ class MainWindow(QMainWindow):
         self._current_path = None
         self._edits = {}
         
-
-    
-
-
         #large image aera
         self.image_display = QLabel("No Image Loaded")
         self.image_display.setAlignment(Qt.AlignCenter)
@@ -359,9 +355,6 @@ class MainWindow(QMainWindow):
                 self._current_path = it.data(Qt.UserRole)
                 self.display_image(it)
         self.statusBar().showMessage(f"Imported project from {path}")
-
-       
-
 
 
 
