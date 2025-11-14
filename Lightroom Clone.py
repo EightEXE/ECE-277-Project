@@ -13,7 +13,7 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import Qt, QSize, QRunnable, QThreadPool, Signal, QObject, QPoint
 from PySide6.QtGui import (
-    QPixmap, QIcon, QImageReader, QFontMetrics, QImage, QColor
+    QPixmap, QIcon, QImageReader, QFontMetrics, QImage
 )
 
 IMAGE_EXTENSIONS = ['.png', '.jpg', '.jpeg', '.bmp', '.gif']
@@ -99,7 +99,7 @@ class MainWindow(QMainWindow):
         self.vbox.addWidget(self.image_display, 1)
         self.vbox.setSizeConstraint(QLayout.SetDefaultConstraint)
 
-        # ---------- Bottom filmstrip ----------
+        # ---------- Bottom filmstrip (now as dock) ----------
         self.thumbs = QListWidget()
         self.thumbs.setObjectName("bottomFilmstrip")
         self.thumbs.setViewMode(QListWidget.IconMode)
@@ -111,13 +111,10 @@ class MainWindow(QMainWindow):
         self.thumbs.setSpacing(10)
         self.thumbs.setUniformItemSizes(True)
         self.thumbs.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
-        self.thumbs.setFixedHeight(130)
         self.thumbs.itemClicked.connect(self._on_thumbnail_clicked)
-        self.vbox.addWidget(self.thumbs, 0)
 
-        self.thumbs.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
-        self.thumbs.setMinimumWidth(0)
-        self.thumbs.setMinimumHeight(self.thumbs.height())
+        # Let the user resize this dock vertically
+        self.thumbs.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
 
         self.thumbs.horizontalScrollBar().valueChanged.connect(
             lambda _: self._ensure_visible_thumbs()
@@ -134,7 +131,8 @@ class MainWindow(QMainWindow):
         self.thumbs.setGridSize(QSize(cell_w, cell_h))
 
         sb_h = self.style().pixelMetric(QStyle.PM_ScrollBarExtent)
-        self.thumbs.setFixedHeight(cell_h + sb_h + 2)
+        # Minimum height that still lets the user shrink/expand it
+        self.thumbs.setMinimumHeight(cell_h + sb_h + 2)
 
         self.thumbs.setResizeMode(QListView.Fixed)
         self.thumbs.setHorizontalScrollMode(QAbstractItemView.ScrollPerPixel)
@@ -152,20 +150,33 @@ class MainWindow(QMainWindow):
         # ---------- Menu ----------
         file_menu = self.menuBar().addMenu("&File")
 
-        self.act_open = file_menu.addAction("&Open Folder")
-        self.act_open.setShortcut("Ctrl+O")
-        self.act_open.triggered.connect(self.open_folder)
+        # New project
+        self.act_new_project = file_menu.addAction("&New Project")
+        self.act_new_project.setShortcut("Ctrl+N")
+        self.act_new_project.triggered.connect(self.new_project)
 
-        self._placeholder_icon = QIcon(QPixmap(icon_w, icon_h))
+
+        # Open PROJECT (.lrc)
+        self.act_open_project = file_menu.addAction("&Open Project...")
+        self.act_open_project.setShortcut("Ctrl+O")
+        self.act_open_project.triggered.connect(self.import_project)
+
+        # Import FOLDER (images)
+        self.act_import_folder = file_menu.addAction("&Import Folder...")
+        self.act_import_folder.setShortcut("Ctrl+I")
+        self.act_import_folder.triggered.connect(self.open_folder)
 
         file_menu.addSeparator()
-        self.act_export = file_menu.addAction("&Save File... (.lrc)")
-        self.act_export.setShortcut("Ctrl+S")
-        self.act_export.triggered.connect(self.export_lrc)
 
-        self.act_import = file_menu.addAction("&Import File... (.lrc)")
-        self.act_import.setShortcut("Ctrl+I")
-        self.act_import.triggered.connect(self.import_project)
+        # Save Project (.lrc)
+        self.act_save_project = file_menu.addAction("&Save Project")
+        self.act_save_project.setShortcut("Ctrl+S")
+        self.act_save_project.triggered.connect(self.export_lrc)
+
+        # placeholder icon for thumbnails
+        self._placeholder_icon = QIcon(QPixmap(icon_w, icon_h))
+
+
 
         # ---------- Right sidebar controls ----------
         # Saturation
@@ -197,23 +208,32 @@ class MainWindow(QMainWindow):
         self.contrast_slider.valueChanged.connect(self._on_contrast_changed)
         self.contrast_slider.sliderReleased.connect(self._on_edit_committed)
 
-        sidebar_dock = QDockWidget("Adjustments", self)
-        sidebar_dock.setFeatures(QDockWidget.DockWidgetMovable | QDockWidget.DockWidgetFloatable)
-        sidebar_dock.setAllowedAreas(Qt.RightDockWidgetArea | Qt.LeftDockWidgetArea)
-        sidebar_dock.setObjectName("rightSidebar")
+        # Right dock (Adjustments)
+        self.right_dock = QDockWidget("Adjustments", self)
+        self.right_dock.setObjectName("rightSidebar")
+        self.right_dock.setAllowedAreas(Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea)
+        self.right_dock.setFeatures(
+            QDockWidget.DockWidgetClosable
+            | QDockWidget.DockWidgetMovable
+            | QDockWidget.DockWidgetFloatable
+        )
 
         sidebar_content = QWidget()
         sidebar_layout = QVBoxLayout(sidebar_content)
         sidebar_layout.addLayout(sat_row)
         sidebar_layout.addLayout(con_row)
         sidebar_layout.addStretch(1)
-        sidebar_dock.setWidget(sidebar_content)
+        self.right_dock.setWidget(sidebar_content)
 
         # ---------- Left dock: Edit tree ----------
-        lSidebar_dock = QDockWidget("Edit History", self)
-        lSidebar_dock.setFeatures(QDockWidget.DockWidgetMovable | QDockWidget.DockWidgetFloatable)
-        lSidebar_dock.setAllowedAreas(Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea)
-        lSidebar_dock.setObjectName("leftSidebar")
+        self.left_dock = QDockWidget("Edit History", self)
+        self.left_dock.setObjectName("leftSidebar")
+        self.left_dock.setAllowedAreas(Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea)
+        self.left_dock.setFeatures(
+            QDockWidget.DockWidgetClosable
+            | QDockWidget.DockWidgetMovable
+            | QDockWidget.DockWidgetFloatable
+        )
 
         lSidebar_content = QWidget()
         lSidebar_layout = QVBoxLayout(lSidebar_content)
@@ -229,13 +249,202 @@ class MainWindow(QMainWindow):
 
         lSidebar_layout.addWidget(history_label)
         lSidebar_layout.addWidget(self.history_tree, 1)
-        lSidebar_dock.setWidget(lSidebar_content)
+        self.left_dock.setWidget(lSidebar_content)
 
-        self.addDockWidget(Qt.LeftDockWidgetArea, lSidebar_dock)
-        self.addDockWidget(Qt.RightDockWidgetArea, sidebar_dock)
+        # ---------- Filmstrip dock ----------
+        self.filmstrip_dock = QDockWidget("Filmstrip", self)
+        self.filmstrip_dock.setObjectName("filmstripDock")
+        self.filmstrip_dock.setAllowedAreas(Qt.AllDockWidgetAreas)
+        self.filmstrip_dock.setFeatures(
+            QDockWidget.DockWidgetClosable
+            | QDockWidget.DockWidgetMovable
+            | QDockWidget.DockWidgetFloatable
+        )
+        self.filmstrip_dock.setWidget(self.thumbs)
+
+        # Add docks to the main window
+        self.addDockWidget(Qt.LeftDockWidgetArea, self.left_dock)
+        self.addDockWidget(Qt.RightDockWidgetArea, self.right_dock)
+        self.addDockWidget(Qt.BottomDockWidgetArea, self.filmstrip_dock)
+
+        # ---------- Window menu: toggles & layout ----------
+        window_menu = self.menuBar().addMenu("&Window")
+
+        self.act_restore_layout = window_menu.addAction("Restore Window Layout")
+        self.act_restore_layout.triggered.connect(self.restore_default_layout)
+
+        window_menu.addSeparator()
+        window_menu.addAction(self.left_dock.toggleViewAction())
+        window_menu.addAction(self.right_dock.toggleViewAction())
+        window_menu.addAction(self.filmstrip_dock.toggleViewAction())
+
+        window_menu.addSeparator()
+        self.act_toggle_statusbar = window_menu.addAction("Show Status Bar")
+        self.act_toggle_statusbar.setCheckable(True)
+        self.act_toggle_statusbar.setChecked(True)
+        self.act_toggle_statusbar.triggered.connect(self._on_toggle_statusbar)
+
+        # --- Full screen toggle (F11) ---
+        window_menu.addSeparator()
+        self.act_fullscreen = window_menu.addAction("Full Screen")
+        self.act_fullscreen.setCheckable(True)
+        self.act_fullscreen.setShortcut("F11")
+        self.act_fullscreen.triggered.connect(self.toggle_fullscreen)
+
+        # fullscreen state
+        self._is_fullscreen_mode = False
+        self._fs_prev_geometry = None
+        self._fs_prev_menubar_visible = True
+        self._fs_prev_statusbar_visible = True
+        self._fs_prev_left_visible = True
+        self._fs_prev_right_visible = True
+        self._fs_prev_filmstrip_visible = True
 
         # ---------- Apply theme ----------
         self._apply_styles()
+
+        # Save the default layout so we can restore it later
+        self._default_layout_state = self.saveState()
+
+    def new_project(self):
+        """Clear everything to start a new blank project."""
+        # Reset project-related containers
+        self._current_folder = None
+        self._current_path = None
+        self._preview_base_image = None
+        self._current_pixmap = None
+
+        self._image_cache.clear()
+        self._image_params.clear()
+        self._image_parents.clear()
+        self._edits.clear()
+
+        # Clear UI elements
+        self.thumbs.clear()
+        self.history_tree.clear()
+        self.image_display.clear()
+        self.image_display.setText("No Image Loaded")
+
+        # Reset sliders
+        self.saturation_slider.blockSignals(True)
+        self.contrast_slider.blockSignals(True)
+
+        self.saturation_slider.setValue(128)
+        self.contrast_slider.setValue(128)
+
+        self.saturation_slider.blockSignals(False)
+        self.contrast_slider.blockSignals(False)
+
+        self.saturation_value.setText("Saturation: 128")
+        self.contrast_value.setText("Contrast: 128")
+        self._current_params["saturation"] = 128
+        self._current_params["contrast"] = 128
+
+        self.statusBar().showMessage("New blank project created.")
+
+
+
+    def toggle_fullscreen(self, checked: bool = False):
+        """Toggle a clean full-screen image-only mode."""
+        # Ignore 'checked' and use our own flag so it always works
+        if not self._is_fullscreen_mode:
+            # ENTER fullscreen
+            self._is_fullscreen_mode = True
+
+            # keep menu action in sync
+            self.act_fullscreen.blockSignals(True)
+            self.act_fullscreen.setChecked(True)
+            self.act_fullscreen.blockSignals(False)
+
+            # save current geometry & visibilities
+            self._fs_prev_geometry = self.saveGeometry()
+
+            mb = self.menuBar()
+            sb = self.statusBar()
+
+            self._fs_prev_menubar_visible = mb.isVisible() if mb else True
+            self._fs_prev_statusbar_visible = sb.isVisible() if sb else True
+
+            self._fs_prev_left_visible = self.left_dock.isVisible()
+            self._fs_prev_right_visible = self.right_dock.isVisible()
+            self._fs_prev_filmstrip_visible = self.filmstrip_dock.isVisible()
+
+            # hide chrome
+            if mb:
+                mb.hide()
+            if sb:
+                sb.hide()
+
+            self.left_dock.hide()
+            self.right_dock.hide()
+            self.filmstrip_dock.hide()
+
+            # go fullscreen
+            self.showFullScreen()
+
+        else:
+            # EXIT fullscreen
+            self._is_fullscreen_mode = False
+
+            # keep menu action in sync
+            self.act_fullscreen.blockSignals(True)
+            self.act_fullscreen.setChecked(False)
+            self.act_fullscreen.blockSignals(False)
+
+            # leave fullscreen
+            self.showNormal()
+
+            # restore geometry
+            if self._fs_prev_geometry is not None:
+                self.restoreGeometry(self._fs_prev_geometry)
+
+            mb = self.menuBar()
+            sb = self.statusBar()
+
+            if mb:
+                mb.setVisible(self._fs_prev_menubar_visible)
+            if sb:
+                sb.setVisible(self._fs_prev_statusbar_visible)
+                # sync the "Show Status Bar" action
+                self.act_toggle_statusbar.blockSignals(True)
+                self.act_toggle_statusbar.setChecked(self._fs_prev_statusbar_visible)
+                self.act_toggle_statusbar.blockSignals(False)
+
+            if self._fs_prev_left_visible:
+                self.left_dock.show()
+            if self._fs_prev_right_visible:
+                self.right_dock.show()
+            if self._fs_prev_filmstrip_visible:
+                self.filmstrip_dock.show()
+
+    def keyPressEvent(self, event):
+        # F11: toggle fullscreen no matter what
+        if event.key() == Qt.Key_F11:
+            self.toggle_fullscreen()
+            event.accept()
+            return
+
+        # Esc: exit fullscreen if we are in it
+        if event.key() == Qt.Key_Escape and self._is_fullscreen_mode:
+            self.toggle_fullscreen()
+            event.accept()
+            return
+
+        # otherwise, normal behavior
+        super().keyPressEvent(event)
+
+
+    # ---------- Window layout helpers ----------
+
+    def restore_default_layout(self):
+        """Restore docks/filmstrip to the original layout."""
+        if hasattr(self, "_default_layout_state"):
+            self.restoreState(self._default_layout_state)
+
+    def _on_toggle_statusbar(self, checked: bool):
+        sb = self.statusBar()
+        if sb is not None:
+            sb.setVisible(checked)
 
     # ---------- Slider callbacks ----------
 
@@ -264,7 +473,6 @@ class MainWindow(QMainWindow):
 
         # Update the tree for this image
         self._update_history_for_current_image()
-
 
     # ---------- History tree logic ----------
 
@@ -880,8 +1088,6 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"Imported project from {path}")
 
 
-
-
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     window = MainWindow()
@@ -898,4 +1104,3 @@ if __name__ == "__main__":
                 print("Failed to auto-load project:", e)
 
     sys.exit(app.exec())
-
