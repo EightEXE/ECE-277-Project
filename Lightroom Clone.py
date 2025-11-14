@@ -16,7 +16,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, QSize, QRunnable, QThreadPool, Signal, QObject, QPoint, QTimer
 
 from PySide6.QtGui import (
-    QPixmap, QIcon, QImageReader, QFontMetrics, QImage
+    QPixmap, QIcon, QImageReader, QFontMetrics, QImage, QPainter, QColor, QPen, QPolygon
 )
 
 IMAGE_EXTENSIONS = ['.png', '.jpg', '.jpeg', '.bmp', '.gif']
@@ -57,6 +57,79 @@ class _ThumbTask(QRunnable):
         else:
             icon = QIcon(QPixmap.fromImage(img))
         self.signals.ready.emit(self.path, icon)
+
+class HistogramWidget(QWidget):
+    """
+    RGB overlaid histogram (0–255) of a QImage,
+    drawn as filled colored shapes on a dark background.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._hist_r = None
+        self._hist_g = None
+        self._hist_b = None
+        self.setMinimumHeight(120)
+
+    def clear_histogram(self):
+        self._hist_r = self._hist_g = self._hist_b = None
+        self.update()
+
+    def set_image(self, qimage: QImage):
+        """Compute RGB histograms from the given image."""
+        if qimage.isNull():
+            self.clear_histogram()
+            return
+
+        img = qimage.convertToFormat(QImage.Format_RGBA8888)
+        w = img.width()
+        h = img.height()
+        bpl = img.bytesPerLine()
+
+        ptr = img.bits()
+        arr = np.frombuffer(ptr, dtype=np.uint8).reshape((h, bpl // 4, 4))
+        rgb = arr[:, :w, :3].astype(np.uint8)
+
+        # Separate channels
+        r = rgb[..., 0].ravel()
+        g = rgb[..., 1].ravel()
+        b = rgb[..., 2].ravel()
+
+        self._hist_r, _ = np.histogram(r, bins=256, range=(0, 255))
+        self._hist_g, _ = np.histogram(g, bins=256, range=(0, 255))
+        self._hist_b, _ = np.histogram(b, bins=256, range=(0, 255))
+
+        self.update()
+
+    def _draw_channel(self, painter: QPainter, hist, color: QColor, rect):
+        """Draw one channel as a filled 'mountain' polygon."""
+        if hist is None or hist.max() == 0:
+            return
+
+        w = rect.width()
+        h = rect.height()
+        max_count = float(hist.max())
+        if max_count <= 0:
+            return
+
+        # Scale factors
+        sx = w / 255.0
+        sy = h / max_count
+
+        # Build polygon: start bottom-left, go along bins, back down
+        poly = QPolygon()
+        # start at left-bottom
+        poly.append(rect.bottomLeft())
+        for i, count in enumerate(hist):
+            x = rect.left() + i * sx
+            y = rect.bottom() - count * sy
+            poly.append(QPoint(int(x), int(y)))
+        # end at right-bottom
+        poly.append(rect.bottomRight())
+
+        painter.setPen(QPen(color.darker(120)))
+        painter.setBrush(color)
+        painter.drawPolygon(poly)
 
 
 class MainWindow(QMainWindow):
@@ -257,9 +330,16 @@ class MainWindow(QMainWindow):
 
         sidebar_content = QWidget()
         sidebar_layout = QVBoxLayout(sidebar_content)
+        # Histogram (above sliders)
+        self.hist_widget = HistogramWidget()
+        hist_label = QLabel("Histogram")
+        sidebar_layout.addWidget(hist_label)
+        sidebar_layout.addWidget(self.hist_widget)
+
         sidebar_layout.addLayout(sat_row)
         sidebar_layout.addLayout(con_row)
         sidebar_layout.addStretch(1)
+        self.right_dock.setWidget(sidebar_content)
         self.right_dock.setWidget(sidebar_content)
 
         # ---------- Left dock: Edit tree ----------
@@ -363,6 +443,17 @@ class MainWindow(QMainWindow):
         self._default_layout_state = self.saveState()
 
         self._copied_params = None
+
+    def _update_histogram(self):
+        """Refresh histogram based on the current displayed pixmap."""
+        if not hasattr(self, "hist_widget"):
+            return
+
+        if self._current_pixmap is None:
+            self.hist_widget.clear_histogram()
+        else:
+            self.hist_widget.set_image(self._current_pixmap.toImage())
+
 
     def _on_history_context_menu(self, pos: QPoint):
         """Show context menu for Active Edit items."""
@@ -590,6 +681,9 @@ class MainWindow(QMainWindow):
         self._current_params["saturation"] = 128
         self._current_params["contrast"] = 128
 
+        if hasattr(self, "hist_widget"):
+            self.hist_widget.clear_histogram()
+
         self.statusBar().showMessage("New blank project created.")
 
 
@@ -729,6 +823,8 @@ class MainWindow(QMainWindow):
 
         # Try autosave (only works if project has been saved once)
         self.export_lrc(autosave=True)
+
+        self._update_histogram()
 
 
     # ---------- History tree logic ----------
@@ -991,6 +1087,9 @@ class MainWindow(QMainWindow):
             self._rescale_preview()
         else:
             self._apply_edit_params_to_current_image(params)
+
+        # update histogram for whatever is now displayed
+        self._update_histogram()
 
     def _apply_edit_params_to_current_image(self, params: dict):
         """Apply saturation + contrast to the preview image using NumPy."""
