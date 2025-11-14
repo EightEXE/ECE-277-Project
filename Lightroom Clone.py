@@ -9,9 +9,10 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QLabel, QListWidget,
     QListWidgetItem, QFileDialog, QStatusBar, QListView, QSizePolicy, QLayout,
     QAbstractItemView, QStyle, QDockWidget, QSlider, QHBoxLayout, QMessageBox,
-    QTreeWidget, QTreeWidgetItem
+    QTreeWidget, QTreeWidgetItem, QDialog, QFormLayout, QSpinBox, QDialogButtonBox
 )
-from PySide6.QtCore import Qt, QSize, QRunnable, QThreadPool, Signal, QObject, QPoint
+from PySide6.QtCore import Qt, QSize, QRunnable, QThreadPool, Signal, QObject, QPoint, QTimer
+
 from PySide6.QtGui import (
     QPixmap, QIcon, QImageReader, QFontMetrics, QImage
 )
@@ -99,6 +100,31 @@ class MainWindow(QMainWindow):
         self.vbox.addWidget(self.image_display, 1)
         self.vbox.setSizeConstraint(QLayout.SetDefaultConstraint)
 
+            # project / image state
+        self._current_folder = None
+        self._current_path = None            # active image path
+        self._current_pixmap = None          # current preview pixmap
+        self._preview_base_image = None      # QImage preview base for active image
+
+        # project file path (for autosave)
+        self._project_path = None            # path to .lrc if saved, else None
+
+        # project / image state
+        self._current_folder = None
+        self._current_path = None            # active image path
+        self._current_pixmap = None          # current preview pixmap
+        self._preview_base_image = None      # QImage preview base for active image
+
+        # project file path (for autosave)
+        self._project_path = None            # path to .lrc if saved, else None
+
+        # autosave preferences
+        self._autosave_interval_min = 5      # default: 5 minutes (0 = off)
+        self._autosave_timer = QTimer(self)
+        self._autosave_timer.timeout.connect(self._on_autosave_timer)
+        self._update_autosave_timer()
+
+
         # ---------- Bottom filmstrip (now as dock) ----------
         self.thumbs = QListWidget()
         self.thumbs.setObjectName("bottomFilmstrip")
@@ -147,6 +173,14 @@ class MainWindow(QMainWindow):
         self._loading = set()
         self._item_for_path = {}
 
+        # ---------- App menu (Lightroom Clone) ----------
+        app_menu = self.menuBar().addMenu("&Lightroom Clone")
+
+        self.act_preferences = app_menu.addAction("&Preferences...")
+        # common on many apps; you can change to Ctrl+P if you prefer
+        self.act_preferences.setShortcut("Ctrl+,")
+        self.act_preferences.triggered.connect(self.show_preferences_dialog)
+
         # ---------- Menu ----------
         file_menu = self.menuBar().addMenu("&File")
 
@@ -175,7 +209,6 @@ class MainWindow(QMainWindow):
 
         # placeholder icon for thumbnails
         self._placeholder_icon = QIcon(QPixmap(icon_w, icon_h))
-
 
 
         # ---------- Right sidebar controls ----------
@@ -305,6 +338,59 @@ class MainWindow(QMainWindow):
 
         # Save the default layout so we can restore it later
         self._default_layout_state = self.saveState()
+
+    def _update_autosave_timer(self):
+        """Start/stop the autosave QTimer based on the current interval."""
+        if self._autosave_interval_min is None or self._autosave_interval_min <= 0:
+            self._autosave_timer.stop()
+            return
+
+        interval_ms = int(self._autosave_interval_min * 60_000)
+        self._autosave_timer.start(interval_ms)
+
+    def _on_autosave_timer(self):
+        """Timer callback: autosave only if project has already been saved."""
+        if self._project_path is None:
+            # user hasn't saved this project yet -> don't autosave
+            return
+        # use the existing export logic in "autosave" mode
+        self.export_lrc(autosave=True)
+
+    def show_preferences_dialog(self):
+        """Show Preferences dialog for app settings (currently: autosave interval)."""
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Preferences - Lightroom Clone")
+
+        layout = QFormLayout(dlg)
+
+        # Autosave interval spinbox
+        spin = QSpinBox(dlg)
+        spin.setRange(0, 120)  # 0 = off, up to 2 hours
+        spin.setSuffix(" min")
+        spin.setValue(self._autosave_interval_min)
+        layout.addRow("Autosave interval:", spin)
+
+        # OK / Cancel buttons
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.Ok | QDialogButtonBox.Cancel,
+            parent=dlg
+        )
+        layout.addRow(buttons)
+
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+
+        if dlg.exec() == QDialog.Accepted:
+            new_val = spin.value()
+            self._autosave_interval_min = new_val
+            self._update_autosave_timer()
+            if new_val <= 0:
+                self.statusBar().showMessage("Autosave disabled.")
+            else:
+                self.statusBar().showMessage(
+                    f"Autosave every {new_val} minute(s)."
+                )
+
 
     def new_project(self):
         """Clear everything to start a new blank project."""
@@ -465,14 +551,21 @@ class MainWindow(QMainWindow):
     def _on_edit_committed(self):
         """Called when any slider is released."""
         if not self._current_path or self._preview_base_image is None:
+            print("[EDIT COMMIT] Skipped: no current image.")
             return
 
         # Save combined params for this image = its "Active Edit"
         self._image_params[self._current_path] = dict(self._current_params)
         self._edits[self._current_path] = dict(self._current_params)
 
+        print(f"[EDIT COMMIT] Params for {self._current_path}: {self._current_params}")
+
         # Update the tree for this image
         self._update_history_for_current_image()
+
+        # Try autosave (only works if project has been saved once)
+        self.export_lrc(autosave=True)
+
 
     # ---------- History tree logic ----------
 
@@ -930,17 +1023,31 @@ class MainWindow(QMainWindow):
             # This creates the parent (Active Edit) + children
             self._update_history_for_current_image()
 
-    def export_lrc(self):
+    def export_lrc(self, autosave: bool = False):
+        """
+        Save the current project to .lrc.
+
+        - If autosave=True and we don't have a project file yet, we do nothing.
+        - If we already have a project file, save directly to it (no dialog).
+        - If no project file and autosave=False, show 'Save Project' dialog
+          and remember chosen path for future autosaves.
+        """
         folder = self._get_active_folder()
         if not folder:
-            QMessageBox.warning(self, "No Folder Loaded", "Please load a folder before exporting.")
+            if autosave:
+                print("[AUTOSAVE] Skipped: no active folder.")
+            else:
+                QMessageBox.warning(
+                    self,
+                    "No Folder Loaded",
+                    "Please load a folder before saving the project."
+                )
             return
 
         folder = os.path.abspath(folder)
         current_rel = _relpath_or_same(self._current_path or "", folder)
 
         # Use _image_params as the canonical "active edit" mapping.
-        # (Fall back to _edits if for some reason _image_params is empty.)
         source_edits = self._image_params if self._image_params else self._edits
 
         edits_rel = {}
@@ -960,26 +1067,57 @@ class MainWindow(QMainWindow):
             "version": LRC_VERSION,
             "created_utc": datetime.utcnow().isoformat() + "Z",
             "folder_path": folder,
-            "current_image": current_rel,        # which image is currently active
-            "edits": edits_rel,                  # per-image Active Edit params
+            "current_image": current_rel,  # which image is currently active
+            "edits": edits_rel,            # per-image Active Edit params
         }
 
-        path, _ = QFileDialog.getSaveFileName(
-            self,
-            "Export Project",
-            os.path.join(folder, "project.lrc"),
-            "Lightroom Clone Project (*.lrc)",
-        )
-        if not path:
-            return
-        if not path.lower().endswith('.lrc'):
-            path += '.lrc'
+        # Decide where to save
+        path = None
+
+        if self._project_path is None:
+            # No project file yet
+            if autosave:
+                # Autosave for unsaved project = do nothing
+                print("[AUTOSAVE] Skipped: project has never been saved.")
+                return
+
+            # Manual save: ask user where to save
+            print("[SAVE] No project_path yet; showing Save dialog...")
+            path, _ = QFileDialog.getSaveFileName(
+                self,
+                "Save Project",
+                os.path.join(folder, "project.lrc"),
+                "Lightroom Clone Project (*.lrc)",
+            )
+            if not path:
+                print("[SAVE] User cancelled save dialog.")
+                return
+            if not path.lower().endswith(".lrc"):
+                path += ".lrc"
+
+            # remember for future autosaves
+            self._project_path = path
+            print(f"[SAVE] New project path set: {self._project_path}")
+        else:
+            # Project already has a file; save directly
+            path = self._project_path
+            if autosave:
+                print(f"[AUTOSAVE] Saving to existing project: {path}")
+            else:
+                print(f"[SAVE] Saving to existing project: {path}")
+
         try:
             with open(path, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2)
-            self.statusBar().showMessage(f"Exported project to {path}")
+            if autosave:
+                self.statusBar().showMessage(f"Autosaved project to {path}", 2000)
+            else:
+                self.statusBar().showMessage(f"Saved project to {path}")
         except Exception as e:
-            QMessageBox.critical(self, "Export Failed", f"Failed to export project: {e}")
+            if autosave:
+                print(f"[AUTOSAVE] ERROR while saving: {e}")
+            else:
+                QMessageBox.critical(self, "Save Failed", f"Failed to save project: {e}")
 
     def import_project(self):
         path, _ = QFileDialog.getOpenFileName(
