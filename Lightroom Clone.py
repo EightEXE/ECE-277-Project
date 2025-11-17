@@ -23,6 +23,8 @@ IMAGE_EXTENSIONS = ['.png', '.jpg', '.jpeg', '.bmp', '.gif']
 LRC_VERSION = "1.0"
 
 
+
+
 def _relpath_or_same(path: str, start: str) -> str:
     try:
         return os.path.relpath(path, start)
@@ -267,10 +269,17 @@ class MainWindow(QMainWindow):
         self._edits = {}                     # used for .lrc export (combined params)
 
         # current parameters (add new ones here)
+                # current parameters (Light tab)
         self._current_params = {
-            "saturation": 128,
+            "exposure": 128,    # 128 = neutral
             "contrast": 128,
+            "highlights": 128,
+            "shadows": 128,
+            "whites": 128,
+            "blacks": 128,
+            "saturation": 128,
         }
+
 
         # ---------- Central image area ----------
         self.image_display = QLabel("No Image Loaded")
@@ -431,35 +440,7 @@ class MainWindow(QMainWindow):
         self._placeholder_icon = QIcon(QPixmap(icon_w, icon_h))
 
 
-                # ---------- Right sidebar controls ----------
-        # Sliders (we'll drop them into sections below)
-        self.saturation_slider = QSlider(Qt.Horizontal)
-        self.saturation_slider.setRange(0, 255)
-        self.saturation_slider.setValue(128)
-        self.saturation_value = QLabel("Saturation: 128")
-
-        sat_row = QHBoxLayout()
-        sat_row.addWidget(QLabel("Saturation"))
-        sat_row.addWidget(self.saturation_slider, 1)
-        sat_row.addWidget(self.saturation_value)
-
-        self.contrast_slider = QSlider(Qt.Horizontal)
-        self.contrast_slider.setRange(0, 255)
-        self.contrast_slider.setValue(128)
-        self.contrast_value = QLabel("Contrast: 128")
-
-        con_row = QHBoxLayout()
-        con_row.addWidget(QLabel("Contrast"))
-        con_row.addWidget(self.contrast_slider, 1)
-        con_row.addWidget(self.contrast_value)
-
-        # Connect slider signals
-        self.saturation_slider.valueChanged.connect(self._on_saturation_changed)
-        self.saturation_slider.sliderReleased.connect(self._on_edit_committed)
-        self.contrast_slider.valueChanged.connect(self._on_contrast_changed)
-        self.contrast_slider.sliderReleased.connect(self._on_edit_committed)
-
-        # Right dock (Adjustments)
+                        # ---------- Right dock: Adjustments (DxO-style) ----------
         self.right_dock = QDockWidget("Adjustments", self)
         self.right_dock.setObjectName("rightSidebar")
         self.right_dock.setAllowedAreas(Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea)
@@ -469,7 +450,54 @@ class MainWindow(QMainWindow):
             | QDockWidget.DockWidgetFloatable
         )
 
-        # Scroll area so we can stack many sections like DxO
+        # --- Light / Basic sliders ---
+        def _make_slider_row(title: str):
+            slider = QSlider(Qt.Horizontal)
+            slider.setRange(0, 255)
+            slider.setValue(128)
+            value_label = QLabel(f"{title}: 128")
+            row = QHBoxLayout()
+            row.addWidget(QLabel(title))
+            row.addWidget(slider, 1)
+            row.addWidget(value_label)
+            return slider, value_label, row
+
+        self.exposure_slider, self.exposure_value, exp_row = _make_slider_row("Exposure")
+        self.contrast_slider, self.contrast_value, con_row = _make_slider_row("Contrast")
+        self.highlights_slider, self.highlights_value, hi_row = _make_slider_row("Highlights")
+        self.shadows_slider, self.shadows_value, sh_row = _make_slider_row("Shadows")
+        self.whites_slider, self.whites_value, wh_row = _make_slider_row("Whites")
+        self.blacks_slider, self.blacks_value, bl_row = _make_slider_row("Blacks")
+        self.saturation_slider, self.saturation_value, sat_row = _make_slider_row("Saturation")
+
+        # Connect slider signals (value change + commit on release)
+        self.exposure_slider.valueChanged.connect(self._on_exposure_changed)
+        self.exposure_slider.sliderReleased.connect(self._on_edit_committed)
+
+        self.contrast_slider.valueChanged.connect(self._on_contrast_changed)
+        self.contrast_slider.sliderReleased.connect(self._on_edit_committed)
+
+        self.highlights_slider.valueChanged.connect(self._on_highlights_changed)
+        self.highlights_slider.sliderReleased.connect(self._on_edit_committed)
+
+        self.shadows_slider.valueChanged.connect(self._on_shadows_changed)
+        self.shadows_slider.sliderReleased.connect(self._on_edit_committed)
+
+        self.whites_slider.valueChanged.connect(self._on_whites_changed)
+        self.whites_slider.sliderReleased.connect(self._on_edit_committed)
+
+        self.blacks_slider.valueChanged.connect(self._on_blacks_changed)
+        self.blacks_slider.sliderReleased.connect(self._on_edit_committed)
+
+        self.saturation_slider.valueChanged.connect(self._on_saturation_changed)
+        self.saturation_slider.sliderReleased.connect(self._on_edit_committed)
+
+        # --- Ensure we have a histogram widget ---
+        if not hasattr(self, "hist_widget"):
+            self.hist_widget = HistogramWidget(self)
+            self.hist_widget.setObjectName("histogramPanel")
+
+        # --- Scrollable adjustments area (Light tab content) ---
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.NoFrame)
@@ -480,22 +508,26 @@ class MainWindow(QMainWindow):
         v.setContentsMargins(4, 4, 4, 4)
         v.setSpacing(6)
 
-        # --- Section 1: Histogram ---
+        # Section 1: Histogram
         hist_section = CollapsibleSection("Histogram", self)
         hist_layout = hist_section.content_layout()
-        # assuming you already have self.hist_widget; if not, we can add later
-        if hasattr(self, "hist_widget"):
-            hist_layout.addWidget(self.hist_widget)
+        hist_layout.addWidget(self.hist_widget)
         v.addWidget(hist_section)
 
-        # --- Section 2: Basic Adjustments (your current sliders) ---
+        # Section 2: Basic Adjustments (Light tab)
         basic_section = CollapsibleSection("Basic Adjustments", self)
         basic_layout = basic_section.content_layout()
-        basic_layout.addLayout(sat_row)
+        basic_layout.addLayout(exp_row)
         basic_layout.addLayout(con_row)
+        basic_layout.addLayout(hi_row)
+        basic_layout.addLayout(sh_row)
+        basic_layout.addLayout(wh_row)
+        basic_layout.addLayout(bl_row)
+        basic_layout.addSpacing(8)
+        basic_layout.addLayout(sat_row)
         v.addWidget(basic_section)
 
-        # --- Placeholder sections for future DxO-style controls ---
+        # Placeholder sections for future tools (you can flesh these out later)
         exposure_section = CollapsibleSection("Exposure Compensation", self, start_collapsed=True)
         exposure_layout = exposure_section.content_layout()
         exposure_layout.addWidget(QLabel("Exposure slider goes here"))
@@ -507,9 +539,70 @@ class MainWindow(QMainWindow):
         v.addWidget(tone_section)
 
         v.addStretch(1)
-
         scroll.setWidget(container)
-        self.right_dock.setWidget(scroll)
+
+        # --- DxO-style icon tab bar at top of Adjustments ---
+        self.adjust_tabs = QTabWidget()
+        self.adjust_tabs.setObjectName("rightTabs")
+        self.adjust_tabs.setTabPosition(QTabWidget.North)
+        self.adjust_tabs.setIconSize(QSize(32, 32))
+        self.adjust_tabs.setDocumentMode(True)   # flatter tabs
+        self.adjust_tabs.setTabsClosable(False)
+        self.adjust_tabs.setMovable(False)
+        
+
+        icons_dir = os.path.join(os.path.dirname(__file__), "icons")
+
+        def load_icon(name: str, fallback_role=None) -> QIcon:
+            path = os.path.join(icons_dir, name)
+            if os.path.exists(path):
+                return QIcon(path)
+            if fallback_role is not None:
+                return self.style().standardIcon(fallback_role)
+            return QIcon()
+
+        # Tab 0: Light (current tools)
+        light_icon = load_icon("light.png", QStyle.SP_DialogYesButton)
+        self.adjust_tabs.addTab(scroll, light_icon, "")
+
+        # Tab 1: Color
+        color_page = QWidget()
+        color_layout = QVBoxLayout(color_page)
+        color_layout.setContentsMargins(4, 4, 4, 4)
+        color_layout.addWidget(QLabel("Color tools coming soon…"))
+        color_layout.addStretch(1)
+        color_icon = load_icon("color.png", QStyle.SP_DialogOpenButton)
+        self.adjust_tabs.addTab(color_page, color_icon, "")
+
+        # Tab 2: Detail
+        detail_page = QWidget()
+        detail_layout = QVBoxLayout(detail_page)
+        detail_layout.setContentsMargins(4, 4, 4, 4)
+        detail_layout.addWidget(QLabel("Detail / sharpening tools coming soon…"))
+        detail_layout.addStretch(1)
+        detail_icon = load_icon("detail.png", QStyle.SP_FileDialogDetailedView)
+        self.adjust_tabs.addTab(detail_page, detail_icon, "")
+
+        # Tab 3: Geometry
+        geo_page = QWidget()
+        geo_layout = QVBoxLayout(geo_page)
+        geo_layout.setContentsMargins(4, 4, 4, 4)
+        geo_layout.addWidget(QLabel("Geometry / crop / perspective coming soon…"))
+        geo_layout.addStretch(1)
+        geo_icon = load_icon("geometry.png", QStyle.SP_ArrowUp)
+        self.adjust_tabs.addTab(geo_page, geo_icon, "")
+
+        # Tab 4: Effects
+        fx_page = QWidget()
+        fx_layout = QVBoxLayout(fx_page)
+        fx_layout.setContentsMargins(4, 4, 4, 4)
+        fx_layout.addWidget(QLabel("Effects / vignettes / film look coming soon…"))
+        fx_layout.addStretch(1)
+        fx_icon = load_icon("fx.png", QStyle.SP_BrowserReload)
+        self.adjust_tabs.addTab(fx_page, fx_icon, "")
+
+        self.right_dock.setWidget(self.adjust_tabs)
+
 
 
         # ---------- Left dock: Edit tree ----------
@@ -646,12 +739,10 @@ class MainWindow(QMainWindow):
     def _on_toggle_filmstrip(self, checked: bool):
         self.thumbs.setVisible(checked)
 
-
     def _on_thumbnail_selection_changed(self):
         item = self.thumbs.currentItem()
         if item is not None:
             self._on_thumbnail_clicked(item)
-
 
     def _on_fs_double_clicked(self, index):
         """When a folder or image is double-clicked in the Folders tab."""
@@ -675,8 +766,6 @@ class MainWindow(QMainWindow):
                     self.thumbs.setCurrentItem(item)
                     self._on_thumbnail_clicked(item)
 
-
-
     def _update_histogram(self):
         """Refresh histogram based on the current displayed pixmap."""
         if not hasattr(self, "hist_widget"):
@@ -686,7 +775,6 @@ class MainWindow(QMainWindow):
             self.hist_widget.clear_histogram()
         else:
             self.hist_widget.set_image(self._current_pixmap.toImage())
-
 
     def _on_history_context_menu(self, pos: QPoint):
         """Show context menu for Active Edit items."""
@@ -721,7 +809,6 @@ class MainWindow(QMainWindow):
             self._paste_active_edit(path)
         elif act_remove is not None and chosen is act_remove:
             self._remove_active_edit_image(path)
-
 
     def _copy_active_edit(self, path: str, params: dict):
         """Copy the params for this tree item (parent or child) into a buffer."""
@@ -775,8 +862,6 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(
             f"Removed {os.path.basename(path)} from Active Edit.", 2000
         )
-
-
 
     def _update_autosave_timer(self):
         """Start/stop the autosave QTimer based on the current interval."""
@@ -835,7 +920,6 @@ class MainWindow(QMainWindow):
                     f"Autosave every {new_val} minute(s)."
                 )
 
-
     def new_project(self):
         """Clear everything to start a new blank project."""
         # Reset project-related containers
@@ -858,26 +942,27 @@ class MainWindow(QMainWindow):
         self.image_display.setText("No Image Loaded")
 
         # Reset sliders
-        self.saturation_slider.blockSignals(True)
-        self.contrast_slider.blockSignals(True)
+                # reset Light sliders
+        for slider, label, key in [
+            (self.exposure_slider, self.exposure_value, "exposure"),
+            (self.contrast_slider, self.contrast_value, "contrast"),
+            (self.highlights_slider, self.highlights_value, "highlights"),
+            (self.shadows_slider, self.shadows_value, "shadows"),
+            (self.whites_slider, self.whites_value, "whites"),
+            (self.blacks_slider, self.blacks_value, "blacks"),
+            (self.saturation_slider, self.saturation_value, "saturation"),
+        ]:
+            slider.blockSignals(True)
+            slider.setValue(128)
+            slider.blockSignals(False)
+            label.setText(f"{key.capitalize()}: 128")
+            self._current_params[key] = 128
 
-        self.saturation_slider.setValue(128)
-        self.contrast_slider.setValue(128)
-
-        self.saturation_slider.blockSignals(False)
-        self.contrast_slider.blockSignals(False)
-
-        self.saturation_value.setText("Saturation: 128")
-        self.contrast_value.setText("Contrast: 128")
-        self._current_params["saturation"] = 128
-        self._current_params["contrast"] = 128
 
         if hasattr(self, "hist_widget"):
             self.hist_widget.clear_histogram()
 
         self.statusBar().showMessage("New blank project created.")
-
-
 
     def toggle_fullscreen(self, checked: bool = False):
         """Toggle a clean full-screen image-only mode."""
@@ -967,7 +1052,6 @@ class MainWindow(QMainWindow):
         # otherwise, normal behavior
         super().keyPressEvent(event)
 
-
     # ---------- Window layout helpers ----------
 
     def restore_default_layout(self):
@@ -993,6 +1077,36 @@ class MainWindow(QMainWindow):
         """Realtime update for contrast slider."""
         self.contrast_value.setText(f"Contrast: {value}")
         self._current_params["contrast"] = value
+        if self._preview_base_image is not None:
+            self._apply_edit_params_to_current_image(self._current_params)
+
+    def _on_exposure_changed(self, value: int):
+        self.exposure_value.setText(f"Exposure: {value}")
+        self._current_params["exposure"] = value
+        if self._preview_base_image is not None:
+            self._apply_edit_params_to_current_image(self._current_params)
+
+    def _on_highlights_changed(self, value: int):
+        self.highlights_value.setText(f"Highlights: {value}")
+        self._current_params["highlights"] = value
+        if self._preview_base_image is not None:
+            self._apply_edit_params_to_current_image(self._current_params)
+
+    def _on_shadows_changed(self, value: int):
+        self.shadows_value.setText(f"Shadows: {value}")
+        self._current_params["shadows"] = value
+        if self._preview_base_image is not None:
+            self._apply_edit_params_to_current_image(self._current_params)
+
+    def _on_whites_changed(self, value: int):
+        self.whites_value.setText(f"Whites: {value}")
+        self._current_params["whites"] = value
+        if self._preview_base_image is not None:
+            self._apply_edit_params_to_current_image(self._current_params)
+
+    def _on_blacks_changed(self, value: int):
+        self.blacks_value.setText(f"Blacks: {value}")
+        self._current_params["blacks"] = value
         if self._preview_base_image is not None:
             self._apply_edit_params_to_current_image(self._current_params)
 
@@ -1138,6 +1252,46 @@ class MainWindow(QMainWindow):
             padding: 4px 20px;
             color: #e6e6e8;
         }}
+                /* Right dock icon tabs (DxO-style) */
+                /* Right dock icon tabs (DxO-style) */
+        QTabWidget#rightTabs::pane {{
+            border: none;
+            background-color: #25272b;
+        }}
+                           
+        /* center the whole tab bar */
+        QTabWidget#rightTabs::tab-bar {{
+            alignment: center;
+        }}
+
+        /* square icon-only tabs, icon centered */
+        QTabWidget#rightTabs > QTabBar::tab {{
+            min-width: 32px;
+            max-width: 32px;
+            min-height: 32px;
+            max-height: 32px;
+            margin: 0;
+            padding: 0;          /* no extra padding -> icon is centered */
+            background-color: #2b2d31;
+            border: 1px solid #33363a;
+        }}
+
+        QTabWidget#rightTabs > QTabBar::tab:selected {{
+            background-color: #2f8fff;
+            border-color: #2f8fff;
+        }}
+
+        QTabWidget#rightTabs > QTabBar::tab:hover:!selected {{
+            background-color: #34373d;
+        }}
+
+        /* center the whole tab bar horizontally inside the pane */
+        QTabWidget#rightTabs::tab-bar {{
+            alignment: center;
+        }}
+
+
+
         QMenu::item:selected {{
             background-color: #3a3b41;
             color: {accent};
@@ -1266,29 +1420,63 @@ class MainWindow(QMainWindow):
             color: #e0e2e6;
         }}
 
-        /* ========== SLIDERS ========== */
+                /* ========== SLIDERS ========== */
 
+        /* Groove: dark -> mid gray gradient, rounded */
         QSlider::groove:horizontal {{
-            height: 4px;
-            background-color: #34363c;
-            border-radius: 2px;
+            border: 1px solid #111111;
+            height: 10px;
+            margin: 6px 10px;         /* space from labels */
+            border-radius: 5px;
+            background: qlineargradient(
+                x1: 0, y1: 0, x2: 1, y2: 0,
+                stop: 0   #0c0d0f,
+                stop: 0.5 #26272b,
+                stop: 1   #3a3b3f
+            );
         }}
-        QSlider::handle:horizontal {{
-            width: 14px;
-            height: 14px;
-            margin: -5px 0;
-            border-radius: 7px;
-            background-color: {accent};
-            border: 1px solid #f5f5f5;
-        }}
+
+        /* Filled part (left of handle) – blue accent with soft gradient */
         QSlider::sub-page:horizontal {{
-            background-color: {accent_soft};
-            border-radius: 2px;
+            border: 1px solid #1d5fcc;
+            border-radius: 5px;
+            background: qlineargradient(
+                x1: 0, y1: 0, x2: 1, y2: 0,
+                stop: 0   #2f8fff,
+                stop: 1   #4fa0ff
+            );
         }}
+
+        /* Unfilled part (right of handle) – darker gray */
         QSlider::add-page:horizontal {{
-            background-color: #242528;
-            border-radius: 2px;
+            border: 1px solid #111111;
+            border-radius: 5px;
+            background: #1b1c20;
         }}
+
+        /* Handle: round white “knob” with subtle outline and shadow */
+        QSlider::handle:horizontal {{
+            background: #fdfdfd;
+            border: 1px solid #1c1d21;
+            width: 16px;
+            height: 16px;
+            margin: -5px 0;          /* makes handle taller than groove */
+            border-radius: 8px;
+            /* fake drop shadow */
+            box-shadow: 0 0 4px rgba(0, 0, 0, 160);
+        }}
+
+        QSlider::handle:horizontal:hover {{
+            background: #ffffff;
+            border-color: #2f8fff;
+        }}
+
+        QSlider::handle:horizontal:disabled {{
+            background: #777777;
+            border-color: #555555;
+        }}
+
+
 
         /* ========== FILMSTRIP ========== */
 
@@ -1342,6 +1530,10 @@ class MainWindow(QMainWindow):
             border: 1px solid #3d4046;
             padding: 3px 10px;
         }}
+
+        
+
+
         QPushButton:hover {{
             background-color: #3a3c42;
             border-color: {accent};
@@ -1434,7 +1626,7 @@ class MainWindow(QMainWindow):
         self._update_histogram()
 
     def _apply_edit_params_to_current_image(self, params: dict):
-        """Apply saturation + contrast to the preview image using NumPy."""
+        """Apply Light tab adjustments (exposure, contrast, tone, saturation) to preview."""
         if self._preview_base_image is None:
             return
 
@@ -1445,34 +1637,73 @@ class MainWindow(QMainWindow):
         h = img.height()
         bpl = img.bytesPerLine()
 
-        ptr = img.bits()  # memoryview
+        ptr = img.bits()
         arr = np.frombuffer(ptr, dtype=np.uint8).reshape((h, bpl // 4, 4))
 
         rgb = arr[:, :w, :3].astype(np.float32)
 
-        # ---- Saturation ----
-        sat_val = params.get("saturation", 128)
-        sat_factor = 1.0 if sat_val == 128 else sat_val / 128.0
-
+        # Luminance for tone mapping
         lum = (
             0.299 * rgb[..., 0] +
             0.587 * rgb[..., 1] +
             0.114 * rgb[..., 2]
-        )[..., None]
+        )
 
-        rgb = lum + (rgb - lum) * sat_factor
+        # ---- Exposure (global brightness) ----
+        exp_val = params.get("exposure", 128)
+        if exp_val != 128:
+            # map 0..255 -> roughly -2..+2 stops
+            exp_stops = (exp_val - 128) / 128.0 * 2.0
+            exp_factor = 2.0 ** exp_stops
+            rgb *= exp_factor
 
-        # ---- Contrast ----
+        # ---- Contrast (already present, but applied before tone sliders) ----
         con_val = params.get("contrast", 128)
-        con_factor = 1.0 if con_val == 128 else con_val / 128.0
-        mid = 128.0
-        rgb = (rgb - mid) * con_factor + mid
+        if con_val != 128:
+            con_factor = con_val / 128.0
+            mid = 128.0
+            rgb = (rgb - mid) * con_factor + mid
 
+        # ---- Tone sliders (highlights / shadows / whites / blacks) ----
+        # Normalize luminance to 0..1
+        L = lum / 255.0
+
+        def tone_strength(val, scale=0.5):
+            # convert slider 0..255 -> approx -scale..+scale
+            return (val - 128.0) / 128.0 * scale
+
+        hi_s = tone_strength(params.get("highlights", 128), 0.6)
+        sh_s = tone_strength(params.get("shadows", 128), 0.6)
+        wh_s = tone_strength(params.get("whites", 128), 0.8)
+        bl_s = tone_strength(params.get("blacks", 128), 0.8)
+
+        if any(abs(x) > 1e-3 for x in (hi_s, sh_s, wh_s, bl_s)):
+            # masks for different tonal ranges
+            highlights_mask = np.clip((L - 0.5) / 0.5, 0.0, 1.0)   # 0.5..1
+            shadows_mask = np.clip((0.5 - L) / 0.5, 0.0, 1.0)      # 0..0.5
+            whites_mask = np.clip((L - 0.8) / 0.2, 0.0, 1.0)       # 0.8..1
+            blacks_mask = np.clip((0.2 - L) / 0.2, 0.0, 1.0)       # 0..0.2
+
+            # apply as local exposure shifts
+            rgb += hi_s * 255.0 * highlights_mask[..., None]
+            rgb += sh_s * 255.0 * shadows_mask[..., None]
+            rgb += wh_s * 255.0 * whites_mask[..., None]
+            rgb += bl_s * 255.0 * blacks_mask[..., None]
+
+        # ---- Saturation ----
+        sat_val = params.get("saturation", 128)
+        if sat_val != 128:
+            sat_factor = sat_val / 128.0
+            lum3 = lum[..., None]  # broadcast
+            rgb = lum3 + (rgb - lum3) * sat_factor
+
+        # clamp and write back
         rgb = np.clip(rgb, 0, 255).astype(np.uint8)
         arr[:, :w, :3] = rgb
 
         self._current_pixmap = QPixmap.fromImage(img)
         self._rescale_preview()
+
 
     def _rescale_preview(self):
         """Resize current pixmap to fit the display label."""
