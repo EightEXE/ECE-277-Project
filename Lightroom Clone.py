@@ -10,11 +10,11 @@ from PySide6.QtWidgets import (
     QListWidgetItem, QFileDialog, QStatusBar, QListView, QSizePolicy, QLayout,
     QAbstractItemView, QStyle, QDockWidget, QSlider, QHBoxLayout, QMessageBox,
     QTreeWidget, QTreeWidgetItem, QDialog, QFormLayout, QSpinBox, QDialogButtonBox,
-    QMenu
+    QMenu, QTabWidget, QTreeView, QFileSystemModel, QScrollArea, QPushButton, QFrame, QTabWidget
 )
 
 from PySide6.QtCore import Qt, QSize, QRunnable, QThreadPool, Signal, QObject, QPoint, QTimer
-
+from PySide6.QtCore import QDir
 from PySide6.QtGui import (
     QPixmap, QIcon, QImageReader, QFontMetrics, QImage, QPainter, QColor, QPen, QPolygon
 )
@@ -131,6 +131,111 @@ class HistogramWidget(QWidget):
         painter.setBrush(color)
         painter.drawPolygon(poly)
 
+class ThumbnailFileSystemModel(QFileSystemModel):
+    """QFileSystemModel that shows thumbnails for supported image files,
+    but falls back to default icons for very large folders so it doesn't
+    blow up on thousands of images.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._thumb_cache = {}
+        self._max_thumbs_per_folder = 500  # tweak if you want
+
+    def _make_thumb_icon(self, path: str) -> QIcon | None:
+        try:
+            reader = QImageReader(path)
+            reader.setAutoTransform(True)
+            reader.setScaledSize(QSize(48, 48))  # small preview
+            img = reader.read()
+            if img.isNull():
+                return None
+            return QIcon(QPixmap.fromImage(img))
+        except Exception:
+            return None
+
+    def data(self, index, role=Qt.DecorationRole):
+        # For everything except DecorationRole, use the default implementation.
+        if role != Qt.DecorationRole:
+            return super().data(index, role)
+
+        if not index.isValid():
+            return super().data(index, role)
+
+        # Only draw an icon in the first column.
+        if index.column() != 0:
+            return super().data(index, role)
+
+        # If this folder has a ton of items, don't generate thumbnails
+        # (use default icons so the UI doesn't die).
+        parent_index = index.parent()
+        if parent_index.isValid():
+            try:
+                if self.rowCount(parent_index) > self._max_thumbs_per_folder:
+                    return super().data(index, role)
+            except Exception:
+                # If rowCount blows up for some reason, just bail out to default.
+                return super().data(index, role)
+
+        path = self.filePath(index)
+        if not path:
+            return super().data(index, role)
+
+        # Directories keep normal folder icons.
+        if self.isDir(index):
+            return super().data(index, role)
+
+        ext = os.path.splitext(path)[1].lower()
+        if ext not in IMAGE_EXTENSIONS:
+            # Non-image files (most are filtered out anyway)
+            return super().data(index, role)
+
+        # Cached thumbnail?
+        icon = self._thumb_cache.get(path)
+        if icon is None:
+            icon = self._make_thumb_icon(path)
+            if icon is None:
+                # Fallback to default file icon if thumbnail failed
+                icon = super().data(index, role)
+            self._thumb_cache[path] = icon
+
+        return icon
+
+class CollapsibleSection(QWidget):
+    """
+    Simple DxO-style collapsible panel:
+    [▼ Title]  (click header to expand/collapse)
+    """
+    def __init__(self, title: str, parent=None, start_collapsed=False):
+        super().__init__(parent)
+
+        self._header_btn = QPushButton(title)
+        self._header_btn.setObjectName("sectionHeaderButton")
+        self._header_btn.setCheckable(True)
+        self._header_btn.setChecked(not start_collapsed)
+        self._header_btn.clicked.connect(self._on_toggled)
+
+        self._content = QWidget()
+        self._content.setObjectName("sectionContent")
+        self._content_layout = QVBoxLayout(self._content)
+        self._content_layout.setContentsMargins(10, 4, 10, 8)
+        self._content_layout.setSpacing(4)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        layout.addWidget(self._header_btn)
+        layout.addWidget(self._content)
+
+        if start_collapsed:
+            self._content.setVisible(False)
+
+    def content_layout(self) -> QVBoxLayout:
+        return self._content_layout
+
+    def _on_toggled(self, checked: bool):
+        self._content.setVisible(checked)
+
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -183,7 +288,7 @@ class MainWindow(QMainWindow):
 
         # project file path (for autosave)
         self._project_path = None            # path to .lrc if saved, else None
-
+        self._project_root = None  
         # project / image state
         self._current_folder = None
         self._current_path = None            # active image path
@@ -205,19 +310,49 @@ class MainWindow(QMainWindow):
         self.thumbs.setObjectName("bottomFilmstrip")
         self.thumbs.setViewMode(QListWidget.IconMode)
         self.thumbs.setIconSize(QSize(100, 100))
+
+        # KEY SETTINGS:
+        self.thumbs.setFlow(QListView.LeftToRight)        # row-major grid
+        self.thumbs.setWrapping(True)                     # wrap to next row
         self.thumbs.setResizeMode(QListWidget.Adjust)
-        self.thumbs.setFlow(QListView.LeftToRight)
-        self.thumbs.setWrapping(False)
         self.thumbs.setMovement(QListWidget.Static)
         self.thumbs.setSpacing(10)
         self.thumbs.setUniformItemSizes(True)
-        self.thumbs.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
-        self.thumbs.itemClicked.connect(self._on_thumbnail_clicked)
+
+        # Vertical scroll only
+        self.thumbs.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.thumbs.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+
+        # Central layout: under the image
+        self.thumbs.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        self.vbox.addWidget(self.thumbs, 0)
+
+        # Use vertical scrollbar for lazy loading
+        self.thumbs.verticalScrollBar().valueChanged.connect(
+            lambda _: self._ensure_visible_thumbs()
+        )
+
+        icon_w = self.thumbs.iconSize().width()
+        icon_h = self.thumbs.iconSize().height()
+        fm = QFontMetrics(self.thumbs.font())
+        text_h = fm.height()
+        pad_h = 8
+
+        cell_w = icon_w + 4     # some side padding
+        cell_h = icon_h + text_h + pad_h
+        self.thumbs.setGridSize(QSize(cell_w, cell_h))
+
+        # reasonable minimum so it doesn't collapse
+        self.thumbs.setMinimumHeight(cell_h * 2)
+
+        self.thumbs.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
+
 
         # Let the user resize this dock vertically
         self.thumbs.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
 
-        self.thumbs.horizontalScrollBar().valueChanged.connect(
+        # Track vertical scrolling for lazy thumbnail loading
+        self.thumbs.verticalScrollBar().valueChanged.connect(
             lambda _: self._ensure_visible_thumbs()
         )
         self.thumbs.verticalScrollBar().valueChanged.connect(
@@ -228,18 +363,26 @@ class MainWindow(QMainWindow):
         fm = QFontMetrics(self.thumbs.font())
         text_h = fm.height()
         pad_h = 8
-        cell_w = icon_w + 16
+        cell_w = icon_w + 32   # a bit of left/right padding
         cell_h = icon_h + text_h + pad_h
 
         self.thumbs.setGridSize(QSize(cell_w, cell_h))
 
-        sb_h = self.style().pixelMetric(QStyle.PM_ScrollBarExtent)
-        # Minimum height that still lets the user shrink/expand it
-        self.thumbs.setMinimumHeight(cell_h + sb_h + 2)
+        # reasonable minimum height so it doesn't collapse to nothing
+        self.thumbs.setMinimumHeight(cell_h * 2)
 
-        self.thumbs.setResizeMode(QListView.Fixed)
-        self.thumbs.setHorizontalScrollMode(QAbstractItemView.ScrollPerPixel)
-        self.thumbs.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.thumbs.setResizeMode(QListView.Adjust)
+        self.thumbs.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
+        self.thumbs.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+
+                # --- connect signals for selecting images ---
+        # click or double-click will load the image into the main view
+        self.thumbs.itemClicked.connect(self._on_thumbnail_clicked)
+        self.thumbs.itemActivated.connect(self._on_thumbnail_clicked)
+
+        # also react when selection changes (keyboard navigation, etc.)
+        self.thumbs.itemSelectionChanged.connect(self._on_thumbnail_selection_changed)
+
 
         self.setStatusBar(QStatusBar(self))
 
@@ -288,8 +431,8 @@ class MainWindow(QMainWindow):
         self._placeholder_icon = QIcon(QPixmap(icon_w, icon_h))
 
 
-        # ---------- Right sidebar controls ----------
-        # Saturation
+                # ---------- Right sidebar controls ----------
+        # Sliders (we'll drop them into sections below)
         self.saturation_slider = QSlider(Qt.Horizontal)
         self.saturation_slider.setRange(0, 255)
         self.saturation_slider.setValue(128)
@@ -300,7 +443,6 @@ class MainWindow(QMainWindow):
         sat_row.addWidget(self.saturation_slider, 1)
         sat_row.addWidget(self.saturation_value)
 
-        # Contrast
         self.contrast_slider = QSlider(Qt.Horizontal)
         self.contrast_slider.setRange(0, 255)
         self.contrast_slider.setValue(128)
@@ -311,10 +453,9 @@ class MainWindow(QMainWindow):
         con_row.addWidget(self.contrast_slider, 1)
         con_row.addWidget(self.contrast_value)
 
-        # connect signals
+        # Connect slider signals
         self.saturation_slider.valueChanged.connect(self._on_saturation_changed)
         self.saturation_slider.sliderReleased.connect(self._on_edit_committed)
-
         self.contrast_slider.valueChanged.connect(self._on_contrast_changed)
         self.contrast_slider.sliderReleased.connect(self._on_edit_committed)
 
@@ -328,23 +469,54 @@ class MainWindow(QMainWindow):
             | QDockWidget.DockWidgetFloatable
         )
 
-        sidebar_content = QWidget()
-        sidebar_layout = QVBoxLayout(sidebar_content)
-        # Histogram (above sliders)
-        self.hist_widget = HistogramWidget()
-        hist_label = QLabel("Histogram")
-        sidebar_layout.addWidget(hist_label)
-        sidebar_layout.addWidget(self.hist_widget)
+        # Scroll area so we can stack many sections like DxO
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
 
-        sidebar_layout.addLayout(sat_row)
-        sidebar_layout.addLayout(con_row)
-        sidebar_layout.addStretch(1)
-        self.right_dock.setWidget(sidebar_content)
-        self.right_dock.setWidget(sidebar_content)
+        container = QWidget()
+        container.setObjectName("adjustmentsContainer")
+        v = QVBoxLayout(container)
+        v.setContentsMargins(4, 4, 4, 4)
+        v.setSpacing(6)
+
+        # --- Section 1: Histogram ---
+        hist_section = CollapsibleSection("Histogram", self)
+        hist_layout = hist_section.content_layout()
+        # assuming you already have self.hist_widget; if not, we can add later
+        if hasattr(self, "hist_widget"):
+            hist_layout.addWidget(self.hist_widget)
+        v.addWidget(hist_section)
+
+        # --- Section 2: Basic Adjustments (your current sliders) ---
+        basic_section = CollapsibleSection("Basic Adjustments", self)
+        basic_layout = basic_section.content_layout()
+        basic_layout.addLayout(sat_row)
+        basic_layout.addLayout(con_row)
+        v.addWidget(basic_section)
+
+        # --- Placeholder sections for future DxO-style controls ---
+        exposure_section = CollapsibleSection("Exposure Compensation", self, start_collapsed=True)
+        exposure_layout = exposure_section.content_layout()
+        exposure_layout.addWidget(QLabel("Exposure slider goes here"))
+        v.addWidget(exposure_section)
+
+        tone_section = CollapsibleSection("Tone Curve", self, start_collapsed=True)
+        tone_layout = tone_section.content_layout()
+        tone_layout.addWidget(QLabel("Tone curve widget goes here"))
+        v.addWidget(tone_section)
+
+        v.addStretch(1)
+
+        scroll.setWidget(container)
+        self.right_dock.setWidget(scroll)
+
 
         # ---------- Left dock: Edit tree ----------
         self.left_dock = QDockWidget("Active Edit", self)
         self.left_dock.setObjectName("leftSidebar")
+        self.left_dock.setAttribute(Qt.WA_StyledBackground, True)
+
         self.left_dock.setAllowedAreas(Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea)
         self.left_dock.setFeatures(
             QDockWidget.DockWidgetClosable
@@ -352,17 +524,65 @@ class MainWindow(QMainWindow):
             | QDockWidget.DockWidgetFloatable
         )
 
-        lSidebar_content = QWidget()
-        lSidebar_layout = QVBoxLayout(lSidebar_content)
+                # ----- Left dock content: tab widget with "Active Edit" + "Folders" -----
+        self.left_tabs = QTabWidget()
+        self.left_tabs.setObjectName("leftTabs")
+        self.left_tabs.setTabPosition(QTabWidget.North)
+        self.left_tabs.setDocumentMode(True)
 
-        history_label = QLabel("Active Edit")
-        history_label.setObjectName("historyLabel")
+        # --- Tab 1: Active Edit ---
+        active_tab = QWidget()
+        active_tab.setObjectName("glassPanelLeft")
+        active_layout = QVBoxLayout(active_tab)
+        active_layout.setContentsMargins(4, 4, 4, 4)
+        active_layout.setSpacing(2)
 
         self.history_tree = QTreeWidget()
         self.history_tree.setObjectName("editHistoryTree")
         self.history_tree.setHeaderHidden(True)
-        self.history_tree.setIconSize(QSize(64, 64))
+        self.history_tree.setIconSize(QSize(32, 32))
         self.history_tree.itemClicked.connect(self._on_history_item_clicked)
+
+        active_layout.addWidget(self.history_tree, 1)
+        self.left_tabs.addTab(active_tab, "Active Edit")
+
+        # --- Tab 2: Folders (file browser) ---
+        folders_tab = QWidget()
+        folders_tab.setObjectName("glassPanelLeft")
+        folders_layout = QVBoxLayout(folders_tab)
+        folders_layout.setContentsMargins(4, 4, 4, 4)
+        folders_layout.setSpacing(2)
+
+        self.fs_model = ThumbnailFileSystemModel(self)
+
+
+        # Show all directories, but only files with supported image extensions
+        filters = QDir.AllDirs | QDir.Drives | QDir.NoDotAndDotDot | QDir.Files
+        self.fs_model.setFilter(filters)
+
+        # Build name filters from IMAGE_EXTENSIONS, e.g. ["*.png", "*.jpg", ...]
+        name_filters = [f"*{ext}" for ext in IMAGE_EXTENSIONS]
+        self.fs_model.setNameFilters(name_filters)
+        self.fs_model.setNameFilterDisables(False)  # hide non-matching files
+
+        self.fs_model.setRootPath(QDir.homePath())
+
+
+        self.fs_view = QTreeView()
+        self.fs_view.setIconSize(QSize(16, 16))  # or 48, 48 if you want bigger
+
+        self.fs_view.setObjectName("folderTree")
+        self.fs_view.setModel(self.fs_model)
+        self.fs_view.setRootIndex(self.fs_model.index(QDir.homePath()))
+        self.fs_view.setHeaderHidden(False)
+        self.fs_view.setSortingEnabled(True)
+        self.fs_view.doubleClicked.connect(self._on_fs_double_clicked)
+
+        folders_layout.addWidget(self.fs_view, 1)
+        self.left_tabs.addTab(folders_tab, "Folders")
+
+        self.left_dock.setWidget(self.left_tabs)
+
 
                 # Right-click menu on Active Edit items
         self.history_tree.setContextMenuPolicy(Qt.CustomContextMenu)
@@ -370,38 +590,13 @@ class MainWindow(QMainWindow):
             self._on_history_context_menu
         )
 
-
-        lSidebar_layout.addWidget(history_label)
-        lSidebar_layout.addWidget(self.history_tree, 1)
-        self.left_dock.setWidget(lSidebar_content)
-
-
-
-        # ---------- Filmstrip dock ----------
-        self.filmstrip_dock = QDockWidget("Filmstrip", self)
-        self.filmstrip_dock.setObjectName("filmstripDock")
-        self.filmstrip_dock.setAllowedAreas(Qt.AllDockWidgetAreas)
-        self.filmstrip_dock.setFeatures(
-            QDockWidget.DockWidgetClosable
-            | QDockWidget.DockWidgetMovable
-            | QDockWidget.DockWidgetFloatable
-        )
-        self.filmstrip_dock.setWidget(self.thumbs)
-
         # Add docks to the main window
         self.addDockWidget(Qt.LeftDockWidgetArea, self.left_dock)
         self.addDockWidget(Qt.RightDockWidgetArea, self.right_dock)
-        self.addDockWidget(Qt.BottomDockWidgetArea, self.filmstrip_dock)
 
                 # Set initial orientation based on starting dock area
-        self._update_filmstrip_orientation(self.dockWidgetArea(self.filmstrip_dock))
 
         # Update orientation whenever the dock is moved
-        self.filmstrip_dock.dockLocationChanged.connect(
-        self._on_filmstrip_location_changed
-        )
-
-
 
         # ---------- Window menu: toggles & layout ----------
         window_menu = self.menuBar().addMenu("&Window")
@@ -412,7 +607,11 @@ class MainWindow(QMainWindow):
         window_menu.addSeparator()
         window_menu.addAction(self.left_dock.toggleViewAction())
         window_menu.addAction(self.right_dock.toggleViewAction())
-        window_menu.addAction(self.filmstrip_dock.toggleViewAction())
+        self.act_toggle_filmstrip = window_menu.addAction("Show Filmstrip")
+        self.act_toggle_filmstrip.setCheckable(True)
+        self.act_toggle_filmstrip.setChecked(True)
+        self.act_toggle_filmstrip.triggered.connect(self._on_toggle_filmstrip)
+
 
         window_menu.addSeparator()
         self.act_toggle_statusbar = window_menu.addAction("Show Status Bar")
@@ -443,6 +642,40 @@ class MainWindow(QMainWindow):
         self._default_layout_state = self.saveState()
 
         self._copied_params = None
+
+    def _on_toggle_filmstrip(self, checked: bool):
+        self.thumbs.setVisible(checked)
+
+
+    def _on_thumbnail_selection_changed(self):
+        item = self.thumbs.currentItem()
+        if item is not None:
+            self._on_thumbnail_clicked(item)
+
+
+    def _on_fs_double_clicked(self, index):
+        """When a folder or image is double-clicked in the Folders tab."""
+        path = self.fs_model.filePath(index)
+        if not path:
+            return
+
+        if os.path.isdir(path):
+            # Double-clicked a folder -> load it into the filmstrip
+            self.load_folder(path)
+        else:
+            # Double-clicked a file -> load its folder,
+            # and if it's an image, select it.
+            folder = os.path.dirname(path)
+            self.load_folder(folder)
+
+            ext = os.path.splitext(path)[1].lower()
+            if ext in IMAGE_EXTENSIONS:
+                item = self._item_for_path.get(path)
+                if item:
+                    self.thumbs.setCurrentItem(item)
+                    self._on_thumbnail_clicked(item)
+
+
 
     def _update_histogram(self):
         """Refresh histogram based on the current displayed pixmap."""
@@ -559,50 +792,6 @@ class MainWindow(QMainWindow):
         self._update_filmstrip_orientation(area)
         self._ensure_visible_thumbs()
 
-
-
-    def _update_filmstrip_orientation(self, area: Qt.DockWidgetArea):
-        """Switch thumbnail layout based on where the dock is placed."""
-        vertical = area in (Qt.LeftDockWidgetArea, Qt.RightDockWidgetArea)
-
-        icon_w = self.thumbs.iconSize().width()
-        icon_h = self.thumbs.iconSize().height()
-        fm = QFontMetrics(self.thumbs.font())
-        text_h = fm.height()
-        pad_h = 8
-        cell_w = icon_w + 16
-        cell_h = icon_h + text_h + pad_h
-        sb_size = self.style().pixelMetric(QStyle.PM_ScrollBarExtent)
-
-        if vertical:
-            # Single column, scroll vertically
-            self.thumbs.setFlow(QListView.TopToBottom)
-            self.thumbs.setWrapping(False)
-            self.thumbs.setViewMode(QListWidget.IconMode)
-
-            self.thumbs.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-            self.thumbs.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
-
-            # grid is still useful for consistent spacing
-            self.thumbs.setGridSize(QSize(cell_w, cell_h))
-
-            # make it easier to resize as a side dock
-            self.thumbs.setMinimumWidth(cell_w + sb_size + 2)
-            self.thumbs.setMinimumHeight(0)
-        else:
-            # Horizontal filmstrip, scroll horizontally
-            self.thumbs.setFlow(QListView.LeftToRight)
-            self.thumbs.setWrapping(False)
-            self.thumbs.setViewMode(QListWidget.IconMode)
-
-            self.thumbs.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
-            self.thumbs.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-
-            self.thumbs.setGridSize(QSize(cell_w, cell_h))
-            self.thumbs.setMinimumHeight(cell_h + sb_size + 2)
-            self.thumbs.setMinimumWidth(0)
-
-
     def _on_autosave_timer(self):
         """Timer callback: autosave only if project has already been saved."""
         if self._project_path is None:
@@ -654,6 +843,8 @@ class MainWindow(QMainWindow):
         self._current_path = None
         self._preview_base_image = None
         self._current_pixmap = None
+        self._project_path = None
+        self._project_root = None
 
         self._image_cache.clear()
         self._image_params.clear()
@@ -711,7 +902,7 @@ class MainWindow(QMainWindow):
 
             self._fs_prev_left_visible = self.left_dock.isVisible()
             self._fs_prev_right_visible = self.right_dock.isVisible()
-            self._fs_prev_filmstrip_visible = self.filmstrip_dock.isVisible()
+            self._fs_prev_filmstrip_visible = self.thumbs.isVisible()
 
             # hide chrome
             if mb:
@@ -721,7 +912,7 @@ class MainWindow(QMainWindow):
 
             self.left_dock.hide()
             self.right_dock.hide()
-            self.filmstrip_dock.hide()
+            self.thumbs.hide()
 
             # go fullscreen
             self.showFullScreen()
@@ -758,8 +949,7 @@ class MainWindow(QMainWindow):
                 self.left_dock.show()
             if self._fs_prev_right_visible:
                 self.right_dock.show()
-            if self._fs_prev_filmstrip_visible:
-                self.filmstrip_dock.show()
+            self.thumbs.setVisible(self._fs_prev_filmstrip_visible)
 
     def keyPressEvent(self, event):
         # F11: toggle fullscreen no matter what
@@ -900,136 +1090,288 @@ class MainWindow(QMainWindow):
     # ---------- Styling ----------
 
     def _apply_styles(self):
-        accent = "#2f8fff"
+        # DxO-style cyan accent
+        accent = "#00b4ff"
+        accent_soft = "rgba(0, 180, 255, 130)"
+
         self.setStyleSheet(f"""
+        /* ========== GLOBAL ==========: */
+
         QMainWindow {{
-            background-color: #2b2b2b;
+            background-color: #1c1d1f;
+            color: #f0f0f0;
         }}
 
-        /* Top menu bar */
-        QMenuBar {{
-            background-color: #3a3a3a;
+        * {{
+            font-family: "Segoe UI", "Roboto", sans-serif;
+            font-size: 9pt;
+        }}
+
+        QLabel {{
             color: #f0f0f0;
+            background: transparent;
+        }}
+
+        /* ========== MENUBAR & MENUS ========== */
+
+        QMenuBar {{
+            background-color: #2b2c2f;
+            color: #f5f5f5;
+            padding: 0 6px;
+            border-bottom: 1px solid #17181a;
         }}
         QMenuBar::item {{
             padding: 4px 10px;
             background: transparent;
         }}
         QMenuBar::item:selected {{
-            background-color: #4a4a4a;
+            background-color: #3a3b3f;
+            border-radius: 2px;
         }}
 
-        /* Status bar */
+        QMenu {{
+            background-color: #2b2c2f;
+            border: 1px solid #3c3d42;
+            padding: 4px 0;
+        }}
+        QMenu::item {{
+            padding: 4px 20px;
+            color: #e6e6e8;
+        }}
+        QMenu::item:selected {{
+            background-color: #3a3b41;
+            color: {accent};
+        }}
+        
+                /* Collapsible sections in Adjustments dock */
+        QWidget#adjustmentsContainer {{
+            background-color: #242528;
+        }}
+
+        QPushButton#sectionHeaderButton {{
+            text-align: left;
+            padding: 4px 10px;
+            border: none;
+            background-color: #303236;
+            color: #f0f0f0;
+            font-weight: 500;
+        }}
+        QPushButton#sectionHeaderButton::checked {{
+            /* same bg; we could add an arrow icon later */
+        }}
+        QPushButton#sectionHeaderButton:hover {{
+            background-color: #3a3c40;
+        }}
+
+        QWidget#sectionContent {{
+            background-color: #26272b;
+            border-bottom: 1px solid #303236;
+        }}
+
+
+        /* ========== STATUS BAR ========== */
+
         QStatusBar {{
-            background-color: #3a3a3a;
-            color: #c0c0c0;
-            border-top: 1px solid #444444;
+            background-color: #222326;
+            color: #b4b6ba;
+            border-top: 1px solid #17181a;
         }}
 
-        /* Central image area */
+        /* ========== CENTRAL IMAGE AREA ========== */
+
         #imageDisplay {{
-            background-color: #262626;
-            border-top: 1px solid #444444;
-            border-bottom: 1px solid #444444;
+            background-color: #141516;
+            border: 1px solid #303236;
             border-radius: 0;
-            color: #dddddd;
+            color: #c3c5c8;
         }}
 
-        /* Dock panels */
+        /* ========== DOCKS (FRAMES + TITLE BARS) ========== */
+
         QDockWidget {{
-            background-color: #262626;
-            border: 1px solid #333333;
+            background-color: #242528;
+            border: 1px solid #303236;
+            border-radius: 0;
         }}
+
         QDockWidget::title {{
-            padding: 4px 8px;
-            background-color: #303030;
-            color: #e0e0e0;
-            border-bottom: 1px solid #444444;
+            padding: 4px 10px;
+            background-color: #303236;
+            color: #f4f4f5;
+            border-bottom: 1px solid #101114;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }}
+
+        QDockWidget::close-button, QDockWidget::float-button {{
+            background: transparent;
+            border: none;
+        }}
+        QDockWidget::close-button:hover, QDockWidget::float-button:hover {{
+            background-color: #3c3e43;
+            border-radius: 3px;
         }}
 
         QDockWidget#leftSidebar {{
-            border-right: 1px solid #444444;
+            border-right: 1px solid #151618;
         }}
         QDockWidget#rightSidebar {{
-            border-left: 1px solid #444444;
+            border-left: 1px solid #151618;
+        }}
+        QDockWidget#filmstripDock {{
+            border-top: 1px solid #151618;
         }}
 
-        /* Bottom filmstrip */
-        QListWidget#bottomFilmstrip {{
-            background-color: #262626;
-            border-top: 1px solid #444444;
-            border-radius: 0;
-        }}
-        QListWidget#bottomFilmstrip::item {{
+        /* INNER PANELS (SIDEBARS) */
+
+        QWidget#glassPanelLeft,
+        QWidget#glassPanelRight {{
+            background-color: #242528;
             border: none;
-            padding: 2px;
-        }}
-        QListWidget#bottomFilmstrip::item:selected {{
-            border: 2px solid {accent};
-            background-color: #303030;
+            margin: 4px;
         }}
 
-        QLabel {{
-            color: #dddddd;
-            background: transparent;
-        }}
-
-        QLabel#historyLabel {{
-            font-weight: bold;
-            color: #f0f0f0;
-            padding: 2px 4px;
-        }}
+        /* ========== ACTIVE EDIT TREE ========== */
 
         QTreeWidget#editHistoryTree {{
-            background-color: #262626;
-            border-top: 1px solid #444444;
-            border-radius: 0;
+            background-color: #242528;
+            border: none;
+            padding: 4px 2px;
         }}
         QTreeWidget#editHistoryTree::item {{
-            padding: 2px;
+            padding: 2px 4px;
             margin: 1px 0;
         }}
         QTreeWidget#editHistoryTree::item:selected {{
-            background-color: #404040;
+            background-color: rgba(0, 180, 255, 40);
             border: 1px solid {accent};
+            border-radius: 2px;
         }}
+        QTreeWidget#editHistoryTree::item:hover:!selected {{
+            background-color: #33353a;
+            border-radius: 2px;
+        }}
+
+        /* ========== HISTOGRAM PANEL ========== */
+
+        #histogramPanel {{
+            background-color: #18191c;
+            border: 1px solid #3a3c42;
+            border-radius: 2px;
+            min-height: 80px;
+        }}
+
+        /* Small label above histogram ("Histogram") */
+        QDockWidget#rightSidebar QLabel {{
+            color: #e0e2e6;
+        }}
+
+        /* ========== SLIDERS ========== */
 
         QSlider::groove:horizontal {{
             height: 4px;
-            background-color: #444444;
+            background-color: #34363c;
             border-radius: 2px;
         }}
         QSlider::handle:horizontal {{
-            width: 16px;
-            height: 16px;
-            margin: -6px 0;
-            border-radius: 8px;
+            width: 14px;
+            height: 14px;
+            margin: -5px 0;
+            border-radius: 7px;
             background-color: {accent};
+            border: 1px solid #f5f5f5;
         }}
         QSlider::sub-page:horizontal {{
-            background-color: {accent};
+            background-color: {accent_soft};
             border-radius: 2px;
         }}
         QSlider::add-page:horizontal {{
-            background-color: #444444;
+            background-color: #242528;
             border-radius: 2px;
         }}
 
+        /* ========== FILMSTRIP ========== */
+
+        QListWidget#bottomFilmstrip {{
+            background-color: #18191b;
+            border-top: 1px solid #303236;
+            border-radius: 0;
+            padding: 3px;
+        }}
+        QListWidget#bottomFilmstrip::item {{
+            border: 1px solid transparent;
+            padding: 2px;
+            border-radius: 2px;
+        }}
+        QListWidget#bottomFilmstrip::item:selected {{
+            border: 1px solid {accent};
+            background-color: rgba(0, 180, 255, 30);
+        }}
+        QListWidget#bottomFilmstrip::item:hover:!selected {{
+            border: 1px solid #50535a;
+            background-color: #26282d;
+        }}
+
+        /* ========== SCROLLBARS ========== */
+
         QScrollBar:horizontal, QScrollBar:vertical {{
-            background: #2b2b2b;
+            background-color: #18191b;
             border: none;
+            margin: 0;
         }}
         QScrollBar::handle:horizontal, QScrollBar::handle:vertical {{
-            background: #555555;
+            background-color: #3b3d43;
             min-width: 20px;
             min-height: 20px;
             border-radius: 3px;
+        }}
+        QScrollBar::handle:hover {{
+            background-color: #4a4d55;
         }}
         QScrollBar::add-line, QScrollBar::sub-line {{
             background: none;
             border: none;
         }}
+
+        /* ========== PUSH BUTTONS (if/when you add them) ========== */
+
+        QPushButton {{
+            background-color: #2f3137;
+            color: #f0f0f0;
+            border-radius: 2px;
+            border: 1px solid #3d4046;
+            padding: 3px 10px;
+        }}
+        QPushButton:hover {{
+            background-color: #3a3c42;
+            border-color: {accent};
+        }}
+        QPushButton:pressed {{
+            background-color: #25272b;
+        }}
+
+                /* Left dock tabs */
+    QTabWidget#leftTabs::pane {{
+            border: none;
+            background-color: #242528;
+        }}
+        QTabBar::tab {{
+            background-color: #2b2c2f;
+            color: #d7d8dd;
+            padding: 4px 10px;
+            margin-right: 1px;
+        }}
+        QTabBar::tab:selected {{
+            background-color: #383a3f;
+            color: {accent};
+        }}
+        QTabBar::tab:hover:!selected {{
+            background-color: #33353a;
+        }}
+
+
         """)
+
 
     # ---------- Image pipeline ----------
 
@@ -1178,16 +1520,17 @@ class MainWindow(QMainWindow):
         vp = self.thumbs.viewport()
         if self.thumbs.count() == 0:
             return
-        row_y = vp.height() // 2
-        first = self.thumbs.indexAt(QPoint(0, row_y)).row()
-        last = self.thumbs.indexAt(QPoint(vp.width() - 1, row_y)).row()
+
+        col_x = vp.width() // 2
+        first = self.thumbs.indexAt(QPoint(col_x, 0)).row()
+        last = self.thumbs.indexAt(QPoint(col_x, vp.height() - 1)).row()
 
         if first < 0:
             first = 0
         if last < 0:
             approx_per_view = max(
                 1,
-                vp.width() // (self.thumbs.iconSize().width() + self.thumbs.spacing())
+                vp.height() // (self.thumbs.iconSize().height() + self.thumbs.spacing())
             )
             last = min(self.thumbs.count() - 1, first + approx_per_view + 4)
 
@@ -1198,6 +1541,55 @@ class MainWindow(QMainWindow):
             it = self.thumbs.item(i)
             self._queue_thumb(it.data(Qt.UserRole))
 
+
+    def _ensure_project_root(self):
+        """Set _project_root if it is not set yet.
+
+        Uses the common parent of all edited images if possible,
+        otherwise falls back to the current folder.
+        """
+        if self._project_root:
+            return
+
+        # Prefer paths from _image_params / _edits
+        all_paths = list(self._image_params.keys() or self._edits.keys())
+        if all_paths:
+            abs_paths = [os.path.abspath(p) for p in all_paths]
+            try:
+                self._project_root = os.path.commonpath(abs_paths)
+            except Exception:
+                # If commonpath fails, just use the first image's folder
+                self._project_root = os.path.dirname(abs_paths[0])
+        else:
+            # No images with edits yet: fall back to active folder if any
+            folder = self._get_active_folder()
+            if folder:
+                self._project_root = os.path.abspath(folder)
+
+    def _encode_project_path(self, abs_path: str) -> str:
+        """Store a path in the .lrc file relative to project_root when possible."""
+        abs_path = os.path.abspath(abs_path)
+        root = self._project_root
+        if root:
+            try:
+                common = os.path.commonpath([abs_path, root])
+                if common == root:
+                    return _relpath_or_same(abs_path, root)
+            except Exception:
+                pass
+        # Fallback: store absolute path
+        return abs_path
+
+    def _decode_project_path(self, stored: str, root: str) -> str:
+        """Convert stored relative/absolute path from .lrc back to absolute."""
+        if os.path.isabs(stored):
+            return os.path.abspath(stored)
+        if root:
+            return _abspath_from_base(stored, root)
+        return os.path.abspath(stored)
+
+
+
     def load_folder(self, folder_path: str):
         self.thumbs.clear()
         self._icon_cache.clear()
@@ -1205,11 +1597,7 @@ class MainWindow(QMainWindow):
         self._item_for_path.clear()
         self._current_folder = folder_path
 
-        # clear per-image state
-        self._image_cache.clear()
-        self._image_params.clear()
-        self._image_parents.clear()
-        self.history_tree.clear()
+        # Only reset the currently shown image; keep _image_params/history.
         self._current_path = None
         self._preview_base_image = None
         self._current_pixmap = None
@@ -1295,45 +1683,44 @@ class MainWindow(QMainWindow):
         - If no project file and autosave=False, show 'Save Project' dialog
           and remember chosen path for future autosaves.
         """
-        folder = self._get_active_folder()
-        if not folder:
-            if autosave:
-                print("[AUTOSAVE] Skipped: no active folder.")
-            else:
-                QMessageBox.warning(
-                    self,
-                    "No Folder Loaded",
-                    "Please load a folder before saving the project."
-                )
-            return
-
-        folder = os.path.abspath(folder)
-        current_rel = _relpath_or_same(self._current_path or "", folder)
-
         # Use _image_params as the canonical "active edit" mapping.
         source_edits = self._image_params if self._image_params else self._edits
 
+        if not source_edits and not self._current_path:
+            if autosave:
+                print("[AUTOSAVE] Skipped: no images to save.")
+            else:
+                QMessageBox.warning(
+                    self,
+                    "Nothing to Save",
+                    "There are no images with edits in this project yet."
+                )
+            return
+
+        # Make sure we have a project root so we can store relative paths
+        self._ensure_project_root()
+
+        # Use project root (or active folder) as default location for Save dialog
+        default_folder = self._project_root or self._get_active_folder() or os.path.expanduser("~")
+
+        # Build edits mapping with project-encoded paths (relative or absolute)
         edits_rel = {}
         for abs_path, params in source_edits.items():
-            try:
-                if os.path.commonpath(
-                    [os.path.abspath(abs_path), folder]
-                ) != folder:
-                    continue
-            except Exception:
-                continue
-            rel = _relpath_or_same(abs_path, folder)
-            edits_rel[rel] = dict(params)
+            key = self._encode_project_path(abs_path)
+            edits_rel[key] = dict(params)
+
+        current_key = ""
+        if self._current_path:
+            current_key = self._encode_project_path(self._current_path)
 
         data = {
             "schema": "ECE 277 LightRoom Project",
             "version": LRC_VERSION,
-            "created_utc": datetime.utcnow().isoformat() + "Z",
-            "folder_path": folder,
-            "current_image": current_rel,  # which image is currently active
+           "created_utc": datetime.utcnow().isoformat() + "Z",
+            "project_root": self._project_root,
+            "current_image": current_key,  # which image is currently active
             "edits": edits_rel,            # per-image Active Edit params
         }
-
         # Decide where to save
         path = None
 
@@ -1349,7 +1736,7 @@ class MainWindow(QMainWindow):
             path, _ = QFileDialog.getSaveFileName(
                 self,
                 "Save Project",
-                os.path.join(folder, "project.lrc"),
+                os.path.join(default_folder, "project.lrc"),
                 "Lightroom Clone Project (*.lrc)",
             )
             if not path:
@@ -1403,21 +1790,24 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Import Failed", "Invalid project file.")
             return
 
-        folder_abs = data.get("folder_path")
-        if not folder_abs or not os.path.isdir(folder_abs):
-            QMessageBox.critical(self, "Import Failed", "Project folder does not exist.")
+        # New format: project_root; fall back to legacy folder_path if needed
+        project_root = data.get("project_root") or data.get("folder_path")
+        if not project_root or not os.path.isdir(project_root):
+            QMessageBox.critical(self, "Import Failed", "Project root folder does not exist.")
             return
 
-        # Load the folder (thumbnails, etc.)
-        self.load_folder(folder_abs)
+        self._project_root = os.path.abspath(project_root)
+
+        # Load some folder into the filmstrip – start at project_root by default
+        self.load_folder(self._project_root)
 
         # Restore per-image Active Edit params
         self._image_params.clear()
         self._edits.clear()
 
         imported_edits = data.get("edits", {})
-        for rel_path, params in imported_edits.items():
-            abs_path = _abspath_from_base(rel_path, folder_abs)
+        for stored_path, params in imported_edits.items():
+            abs_path = self._decode_project_path(stored_path, self._project_root)
             self._image_params[abs_path] = dict(params)
             self._edits[abs_path] = dict(params)
 
@@ -1458,26 +1848,39 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Import Failed", "Invalid project file.")
             return
 
-        folder_abs = data.get("folder_path")
-        if not folder_abs or not os.path.isdir(folder_abs):
-            QMessageBox.critical(self, "Import Failed", "Project folder does not exist.")
+        # NEW: use project_root if present, else fall back to old folder_path
+        project_root = data.get("project_root") or data.get("folder_path")
+        if not project_root or not os.path.isdir(project_root):
+            QMessageBox.critical(self, "Import Failed", "Project root folder does not exist.")
             return
 
-        self.load_folder(folder_abs)
+        # Remember project root for path encoding/decoding
+        self._project_root = os.path.abspath(project_root)
 
+        # Show something in the UI: load the root into the filmstrip
+        self.load_folder(self._project_root)
+
+        # Restore per-image Active Edit params
         imported_edits = data.get("edits", {})
         self._image_params.clear()
         self._edits.clear()
 
-        for rel_path, params in imported_edits.items():
-            abs_path = _abspath_from_base(rel_path, folder_abs)
+        for stored_path, params in imported_edits.items():
+            # stored_path may be relative to project_root or absolute
+            abs_path = self._decode_project_path(stored_path, self._project_root)
             self._image_params[abs_path] = dict(params)
             self._edits[abs_path] = dict(params)
 
+        # Rebuild the left "Active Edit" tree for all images
         self._rebuild_history_from_params()
 
+        # Restore current image/view
         current_rel = data.get("current_image", "")
-        current_abs = _abspath_from_base(current_rel, folder_abs) if current_rel else None
+        current_abs = (
+            self._decode_project_path(current_rel, self._project_root)
+            if current_rel
+            else None
+        )
 
         if current_abs and os.path.isfile(current_abs):
             it = self._item_for_path.get(current_abs)
@@ -1485,11 +1888,16 @@ class MainWindow(QMainWindow):
                 self.thumbs.setCurrentItem(it)
                 self._on_thumbnail_clicked(it)
 
-        #  Again: tell autosave what file to use
+            parent = self._image_parents.get(current_abs)
+            if parent is not None:
+                self.history_tree.setCurrentItem(parent)
+
+        # Tell autosave what file to use
         self._project_path = os.path.abspath(path)
         print(f"[IMPORT FROM PATH] Project path set to: {self._project_path}")
 
         self.statusBar().showMessage(f"Imported project from {path}")
+
 
 
 
