@@ -1,7 +1,10 @@
-import os
+﻿import os
 import sys
 import json
 from datetime import datetime
+
+# Prefer software OpenGL for compatibility unless overridden.
+os.environ.setdefault("QT_OPENGL", os.environ.get("LRC_QT_OPENGL", "software"))
 
 import numpy as np
 
@@ -15,16 +18,48 @@ from PySide6.QtWidgets import (
     QListWidgetItem, QFileDialog, QStatusBar, QListView, QSizePolicy, QLayout,
     QAbstractItemView, QStyle, QDockWidget, QSlider, QHBoxLayout, QMessageBox,
     QTreeWidget, QTreeWidgetItem, QDialog, QFormLayout, QSpinBox, QDialogButtonBox,
-    QMenu, QTabWidget, QTreeView, QFileSystemModel, QScrollArea, QPushButton, QFrame, QComboBox
+    QMenu, QTabWidget, QTreeView, QFileSystemModel, QScrollArea, QPushButton, QFrame,
+    QComboBox, QStackedWidget, QToolButton, QDoubleSpinBox, QCheckBox, QButtonGroup,
+    QSplitter, QColorDialog
 )
 from PySide6.QtCore import (
-    Qt, QSize, QRunnable, QThreadPool, Signal, QObject, QPoint, QTimer, QDir, QEvent
+    Qt, QSize, QRunnable, QThreadPool, Signal, QObject, QPoint, QTimer, QDir, QPointF, QRectF
 )
 from PySide6.QtGui import (
     QPixmap, QIcon, QImageReader, QFontMetrics, QImage, QPainter,
-    QColor, QPen, QPolygon
+    QColor, QPen, QPolygon, QSurfaceFormat, QConicalGradient, QRadialGradient,
+    QLinearGradient
 )
 from PIL import Image, ExifTags
+
+_ENV_ENABLE = os.environ.get("LRC_ENABLE_OPENGL")
+_ENV_DISABLE = os.environ.get("LRC_DISABLE_OPENGL")
+if _ENV_ENABLE is not None:
+    _USE_OPENGL_PREVIEW = _ENV_ENABLE.lower() in {"1", "true", "yes"}
+elif _ENV_DISABLE is not None:
+    _USE_OPENGL_PREVIEW = not (_ENV_DISABLE.lower() in {"1", "true", "yes"})
+else:
+    _USE_OPENGL_PREVIEW = True
+
+_QT_OPENGL_MODE = os.environ.get("QT_OPENGL", "").lower()
+fmt = QSurfaceFormat()
+if _QT_OPENGL_MODE == "desktop":
+    fmt.setRenderableType(QSurfaceFormat.OpenGL)
+    fmt.setVersion(3, 2)
+    fmt.setProfile(QSurfaceFormat.CoreProfile)
+else:
+    fmt.setRenderableType(QSurfaceFormat.OpenGLES)
+    fmt.setVersion(3, 0)
+QSurfaceFormat.setDefaultFormat(fmt)
+
+try:
+    if _USE_OPENGL_PREVIEW:
+        from lightroom_clone.gl_viewer import GLImageView  # type: ignore
+    else:
+        GLImageView = None
+except Exception as e:
+    print("[OpenGL] Preview disabled:", e)
+    GLImageView = None
 
 IMAGE_EXTENSIONS = [".png", ".jpg", ".jpeg", ".bmp", ".gif"]
 
@@ -54,29 +89,57 @@ def _abspath_from_base(maybe_rel: str, base: str) -> str:
         return os.path.abspath(maybe_rel)
     return os.path.abspath(os.path.join(base, maybe_rel))
 
-def _load_qimage_any(path: str) -> QImage | None:
+def _load_qimage_any(
+    path: str,
+    *,
+    max_long_edge: int | None = None,
+    raw_fast: bool = False,
+) -> QImage | None:
     """
     Load a QImage from path.
     Uses rawpy for RAW files when available, otherwise QImageReader.
+    Can optionally limit the output size for faster previews.
     Returns None on failure.
     """
     ext = os.path.splitext(path)[1].lower()
+
+    def _maybe_scale(img: QImage) -> QImage:
+        if max_long_edge is None:
+            return img
+        w = img.width()
+        h = img.height()
+        if w <= 0 or h <= 0:
+            return img
+        max_side = max(w, h)
+        if max_side <= max_long_edge:
+            return img
+        return img.scaled(
+            max_long_edge,
+            max_long_edge,
+            Qt.KeepAspectRatio,
+            Qt.SmoothTransformation,
+        )
 
     # RAW path: use rawpy if present
     if ext in RAW_EXTENSIONS and rawpy is not None:
         try:
             with rawpy.imread(path) as raw:
-                # 8-bit sRGB-ish output, no crazy auto-bright
-                rgb = raw.postprocess(
-                    output_bps=8,
-                    no_auto_bright=True,
-                    gamma=(2.2, 4.5),
-                )
-            h, w, ch = rgb.shape  # ch should be 3
-            # stride = bytes per line = 3 * w
+                post_kwargs = {
+                    "output_bps": 8,
+                    "no_auto_bright": True,
+                    "gamma": (2.2, 4.5),
+                    "use_camera_wb": True,
+                }
+                if raw_fast and max_long_edge is not None:
+                    longest = max(raw.sizes.raw_height, raw.sizes.raw_width)
+                    if longest > max_long_edge * 1.5:
+                        post_kwargs["half_size"] = True
+                rgb = raw.postprocess(**post_kwargs)
+            h, w, _ = rgb.shape
             img = QImage(rgb.data, w, h, 3 * w, QImage.Format_RGB888)
-            # make a deep copy so the numpy buffer can be freed
-            return img.copy()
+            img = img.copy()
+            img = _maybe_scale(img)
+            return img.convertToFormat(QImage.Format_RGBA8888)
         except Exception as e:
             print(f"[RAW] Failed to decode {path}: {e}")
             return None
@@ -84,17 +147,87 @@ def _load_qimage_any(path: str) -> QImage | None:
     # Fallback: normal image via Qt
     reader = QImageReader(path)
     reader.setAutoTransform(True)
+    if max_long_edge is not None:
+        size = reader.size()
+        if size.isValid():
+            max_side = max(size.width(), size.height())
+            if max_side > max_long_edge:
+                scale = max_long_edge / max_side
+                scaled = QSize(
+                    max(1, int(size.width() * scale)),
+                    max(1, int(size.height() * scale)),
+                )
+                reader.setScaledSize(scaled)
     img = reader.read()
     if img.isNull():
         return None
-    return img
+    return img.convertToFormat(QImage.Format_RGBA8888)
+
+
+def _rgb_to_hsv_np(rgb):
+    rgb_norm = np.clip(rgb / 255.0, 0.0, 1.0)
+    r = rgb_norm[..., 0]
+    g = rgb_norm[..., 1]
+    b = rgb_norm[..., 2]
+    maxc = np.max(rgb_norm, axis=-1)
+    minc = np.min(rgb_norm, axis=-1)
+    delta = maxc - minc
+
+    h = np.zeros_like(maxc)
+    s = np.zeros_like(maxc)
+    v = maxc
+
+    nonzero = maxc > 0
+    s[nonzero] = delta[nonzero] / maxc[nonzero]
+
+    mask = delta > 1e-6
+    r_mask = (maxc == r) & mask
+    g_mask = (maxc == g) & mask
+    b_mask = (maxc == b) & mask
+
+    h[r_mask] = ((g - b)[r_mask] / delta[r_mask]) % 6
+    h[g_mask] = ((b - r)[g_mask] / delta[g_mask]) + 2
+    h[b_mask] = ((r - g)[b_mask] / delta[b_mask]) + 4
+    h = (h / 6.0) % 1.0
+
+    return h, s, v
+
+
+def _hsv_to_rgb_np(h, s, v):
+    h = (h % 1.0) * 6.0
+    i = np.floor(h).astype(int)
+    f = h - i
+    p = v * (1.0 - s)
+    q = v * (1.0 - s * f)
+    t = v * (1.0 - s * (1.0 - f))
+
+    r = np.zeros_like(v)
+    g = np.zeros_like(v)
+    b = np.zeros_like(v)
+
+    idx = i % 6
+    mask = idx == 0
+    r[mask], g[mask], b[mask] = v[mask], t[mask], p[mask]
+    mask = idx == 1
+    r[mask], g[mask], b[mask] = q[mask], v[mask], p[mask]
+    mask = idx == 2
+    r[mask], g[mask], b[mask] = p[mask], v[mask], t[mask]
+    mask = idx == 3
+    r[mask], g[mask], b[mask] = p[mask], q[mask], v[mask]
+    mask = idx == 4
+    r[mask], g[mask], b[mask] = t[mask], p[mask], v[mask]
+    mask = idx == 5
+    r[mask], g[mask], b[mask] = v[mask], p[mask], q[mask]
+
+    rgb = np.stack([r, g, b], axis=-1)
+    return np.clip(rgb * 255.0, 0, 255)
 
 
 
 # ----------------- thumbnail worker ----------------- #
 
 class _WorkerSignals(QObject):
-    ready = Signal(str, QIcon)
+    ready = Signal(str, QImage)
 
 
 class _ThumbTask(QRunnable):
@@ -107,13 +240,20 @@ class _ThumbTask(QRunnable):
         self.signals = _WorkerSignals()
 
     def run(self):
-        img = _load_qimage_any(self.path)
-        if img is None:
-            icon = QIcon()
+        max_dim = max(self.size.width(), self.size.height()) * 2
+        img = _load_qimage_any(self.path, max_long_edge=max_dim, raw_fast=True)
+        if img is not None:
+            max_side = max(self.size.width(), self.size.height()) * 2
+            if img.width() > max_side or img.height() > max_side:
+                img = img.scaled(
+                    max_side,
+                    max_side,
+                    Qt.KeepAspectRatio,
+                    Qt.SmoothTransformation,
+                )
         else:
-            img = img.scaled(self.size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-            icon = QIcon(QPixmap.fromImage(img))
-        self.signals.ready.emit(self.path, icon)
+            img = QImage()
+        self.signals.ready.emit(self.path, img)
 
 
 
@@ -212,6 +352,120 @@ class HistogramWidget(QWidget):
         self._draw_channel(painter, self._hist_b, QColor(80, 160, 255, 180), r)
 
 
+class SoftwareImageView(QWidget):
+    """Fallback preview widget when OpenGL is unavailable."""
+
+    zoomChanged = Signal(float)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._label = QLabel("No Image Loaded", self)
+        self._label.setAlignment(Qt.AlignCenter)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self._label, 1)
+
+        self._pixmap = QPixmap()
+        self._zoom_factor = 1.0
+        self._fit_mode = True
+
+    def has_image(self) -> bool:
+        return not self._pixmap.isNull()
+
+    def clear_image(self):
+        self._pixmap = QPixmap()
+        self._label.setPixmap(QPixmap())
+        self._label.setText("No Image Loaded")
+        self._zoom_factor = 1.0
+        self._fit_mode = True
+        self.zoomChanged.emit(1.0)
+
+    def set_image(self, image: QImage):
+        if image is None or image.isNull():
+            self.clear_image()
+            return
+        self._pixmap = QPixmap.fromImage(image)
+        self._fit_mode = True
+        self._apply_zoom()
+
+    def update_cpu_pixmap(self, pixmap: QPixmap | None):
+        if pixmap is None or pixmap.isNull():
+            return
+        self._pixmap = QPixmap(pixmap)
+        self._apply_zoom()
+
+    def set_params(self, params: dict):
+        # Software view renders whatever pixmap is provided; edits happen elsewhere.
+        return
+
+    def set_manual_zoom(self, factor: float) -> float:
+        if not self.has_image():
+            return self._zoom_factor
+        factor = max(0.05, min(12.0, factor))
+        self._fit_mode = False
+        self._zoom_factor = factor
+        self._apply_zoom()
+        self.zoomChanged.emit(self._zoom_factor)
+        return self._zoom_factor
+
+    def fit_to_window(self) -> float:
+        if not self.has_image():
+            return self._zoom_factor
+        self._fit_mode = True
+        self._zoom_factor = self._compute_fit_zoom()
+        self._apply_zoom()
+        self.zoomChanged.emit(self._zoom_factor)
+        return self._zoom_factor
+
+    def current_zoom(self) -> float:
+        return self._zoom_factor
+
+    def capture_image(self, max_side: int | None = None) -> QImage:
+        if not self.has_image():
+            return QImage()
+        img = self._pixmap.toImage()
+        if max_side and max(img.width(), img.height()) > max_side:
+            img = img.scaled(
+                max_side,
+                max_side,
+                Qt.KeepAspectRatio,
+                Qt.SmoothTransformation,
+            )
+        return img
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if self._fit_mode and self.has_image():
+            self._zoom_factor = self._compute_fit_zoom()
+            self._apply_zoom()
+            self.zoomChanged.emit(self._zoom_factor)
+
+    def _compute_fit_zoom(self) -> float:
+        if not self.has_image() or self.width() <= 0 or self.height() <= 0:
+            return self._zoom_factor
+        pw = max(1, self._pixmap.width())
+        ph = max(1, self._pixmap.height())
+        return min(self.width() / pw, self.height() / ph)
+
+    def _apply_zoom(self):
+        if not self.has_image():
+            self._label.setPixmap(QPixmap())
+            self._label.setText("No Image Loaded")
+            return
+
+        target_w = max(1, int(self._pixmap.width() * self._zoom_factor))
+        target_h = max(1, int(self._pixmap.height() * self._zoom_factor))
+        scaled = self._pixmap.scaled(
+            target_w,
+            target_h,
+            Qt.KeepAspectRatio,
+            Qt.SmoothTransformation,
+        )
+        self._label.setPixmap(scaled)
+        self._label.setText("")
+
+
 # ----------------- QFileSystemModel with thumbs ----------------- #
 
 class ThumbnailFileSystemModel(QFileSystemModel):
@@ -228,7 +482,7 @@ class ThumbnailFileSystemModel(QFileSystemModel):
 
     def _make_thumb_icon(self, path: str) -> QIcon | None:
         try:
-            img = _load_qimage_any(path)
+            img = _load_qimage_any(path, max_long_edge=256, raw_fast=True)
             if img is None:
                 return None
             img = img.scaled(48, 48, Qt.KeepAspectRatio, Qt.SmoothTransformation)
@@ -312,6 +566,457 @@ class CollapsibleSection(QWidget):
 
     def _on_toggled(self, checked: bool):
         self._content.setVisible(checked)
+
+
+class CurvesWidget(QWidget):
+    pointsChanged = Signal(list)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMinimumHeight(200)
+        self.setMouseTracking(True)
+        self._points = [(0.0, 0.0), (1.0, 1.0)]
+        self._drag_index: int | None = None
+
+    def get_points(self) -> list[tuple[float, float]]:
+        return list(self._points)
+
+    def set_points(self, pts: list[tuple[float, float]]):
+        if len(pts) >= 2:
+            self._points = sorted(pts, key=lambda p: p[0])
+            self._points[0] = (0.0, self._points[0][1])
+            self._points[-1] = (1.0, self._points[-1][1])
+            self._emit_changed()
+            self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        rect = self.rect().adjusted(10, 10, -10, -10)
+        painter.fillRect(rect, QColor(30, 31, 35))
+        painter.setPen(QPen(QColor(70, 72, 78)))
+        for i in range(1, 4):
+            x = rect.left() + rect.width() * i / 4
+            y = rect.top() + rect.height() * i / 4
+            painter.drawLine(int(x), rect.top(), int(x), rect.bottom())
+            painter.drawLine(rect.left(), int(y), rect.right(), int(y))
+        painter.setPen(QPen(QColor(120, 180, 255), 2))
+        prev = None
+        for x, y in self._points:
+            px = rect.left() + x * rect.width()
+            py = rect.bottom() - y * rect.height()
+            if prev is not None:
+                painter.drawLine(prev[0], prev[1], px, py)
+            prev = (px, py)
+        painter.setBrush(QColor(255, 200, 0))
+        painter.setPen(QPen(Qt.black))
+        for x, y in self._points:
+            px = rect.left() + x * rect.width()
+            py = rect.bottom() - y * rect.height()
+            painter.drawEllipse(QPointF(px, py), 5, 5)
+
+    def mousePressEvent(self, event):
+        if event.button() != Qt.LeftButton:
+            return super().mousePressEvent(event)
+        idx = self._point_at(event.position())
+        if idx is None:
+            self._add_point(event.position())
+        else:
+            self._drag_index = idx
+        super().mousePressEvent(event)
+
+    def mouseDoubleClickEvent(self, event):
+        if event.button() != Qt.LeftButton:
+            return super().mouseDoubleClickEvent(event)
+        idx = self._point_at(event.position())
+        if idx is not None and idx not in (0, len(self._points) - 1):
+            self._points.pop(idx)
+            self._emit_changed()
+            self.update()
+        super().mouseDoubleClickEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._drag_index is None:
+            return super().mouseMoveEvent(event)
+        self._move_point(self._drag_index, event.position())
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        self._drag_index = None
+        super().mouseReleaseEvent(event)
+
+    def _point_at(self, pos: QPointF) -> int | None:
+        rect = self.rect().adjusted(10, 10, -10, -10)
+        for idx, (x, y) in enumerate(self._points):
+            px = rect.left() + x * rect.width()
+            py = rect.bottom() - y * rect.height()
+            if QRectF(px - 8, py - 8, 16, 16).contains(pos):
+                return idx
+        return None
+
+    def _add_point(self, pos: QPointF):
+        rect = self.rect().adjusted(10, 10, -10, -10)
+        x = (pos.x() - rect.left()) / rect.width()
+        y = (rect.bottom() - pos.y()) / rect.height()
+        x = min(1.0, max(0.0, x))
+        y = min(1.0, max(0.0, y))
+        self._points.append((x, y))
+        self._points.sort(key=lambda p: p[0])
+        self._drag_index = self._points.index((x, y))
+        self._emit_changed()
+        self.update()
+
+
+class ColorWheelWidget(QWidget):
+    hueChanged = Signal(float)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMinimumSize(180, 180)
+        self._hue = 0.0
+
+    def set_hue(self, hue: float):
+        self._hue = hue % 360
+        self.hueChanged.emit(self._hue)
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        rect = self.rect().adjusted(6, 6, -6, -6)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        painter.setPen(Qt.NoPen)
+
+        radius = min(rect.width(), rect.height()) / 2
+        center = rect.center()
+
+        gradient = QConicalGradient(center, 0)
+        for angle in range(0, 360, 10):
+            gradient.setColorAt(angle / 360.0, QColor.fromHsv(angle, 255, 255))
+        painter.setBrush(gradient)
+        painter.drawEllipse(rect)
+
+        radial = QRadialGradient(center, radius)
+        radial.setColorAt(0.0, QColor(255, 255, 255))
+        radial.setColorAt(1.0, QColor(0, 0, 0, 0))
+        painter.setBrush(radial)
+        painter.drawEllipse(rect)
+
+        painter.setPen(QPen(Qt.white, 2))
+        angle_rad = np.radians(self._hue)
+        dot_x = center.x() + np.cos(angle_rad) * radius * 0.85
+        dot_y = center.y() - np.sin(angle_rad) * radius * 0.85
+        painter.drawEllipse(QPointF(dot_x, dot_y), 6, 6)
+
+    def mousePressEvent(self, event):
+        self._update_hue_from_pos(event.position())
+
+    def mouseMoveEvent(self, event):
+        if event.buttons() & Qt.LeftButton:
+            self._update_hue_from_pos(event.position())
+
+    def _update_hue_from_pos(self, pos: QPointF):
+        center = self.rect().center()
+        dx = pos.x() - center.x()
+        dy = center.y() - pos.y()
+        angle = np.degrees(np.arctan2(dy, dx)) % 360
+        self.set_hue(angle)
+    def _move_point(self, idx: int, pos: QPointF):
+        rect = self.rect().adjusted(10, 10, -10, -10)
+        x = (pos.x() - rect.left()) / rect.width()
+        y = (rect.bottom() - pos.y()) / rect.height()
+        x = min(1.0, max(0.0, x))
+        y = min(1.0, max(0.0, y))
+        if idx == 0:
+            x = 0.0
+        elif idx == len(self._points) - 1:
+            x = 1.0
+        else:
+            left = self._points[idx - 1][0] + 0.01
+            right = self._points[idx + 1][0] - 0.01
+            x = min(right, max(left, x))
+        self._points[idx] = (x, min(1.0, max(0.0, y)))
+        self._points = sorted(self._points, key=lambda p: p[0])
+        self._drag_index = self._points.index((x, min(1.0, max(0.0, y))))
+        self._emit_changed()
+
+
+class GradientStopEditor(QWidget):
+    stopsChanged = Signal(list)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMinimumHeight(70)
+        self._stops = [
+            (0.0, QColor("#ff4b4b")),
+            (0.5, QColor("#57d1ff")),
+            (1.0, QColor("#4bff88")),
+        ]
+        self._drag_index: int | None = None
+
+    def set_stops(self, stops: list[tuple[float, QColor]]):
+        if not stops:
+            return
+        clean = []
+        for pos, color in stops:
+            if isinstance(color, str):
+                color = QColor(color)
+            clean.append((float(max(0.0, min(1.0, pos))), QColor(color)))
+        self._stops = sorted(clean, key=lambda s: s[0])
+        self.update()
+
+    def stops(self) -> list[tuple[float, QColor]]:
+        return [(pos, QColor(color)) for pos, color in self._stops]
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        track_rect = self.rect().adjusted(12, 12, -12, -26)
+        gradient = QLinearGradient(track_rect.topLeft(), track_rect.topRight())
+        for pos, color in self._stops:
+            gradient.setColorAt(pos, color)
+        painter.setBrush(gradient)
+        painter.setPen(QPen(QColor("#3d3e42")))
+        painter.drawRect(track_rect)
+
+        for idx, (pos, color) in enumerate(self._stops):
+            x = track_rect.left() + pos * track_rect.width()
+            points = [
+                QPointF(x, track_rect.bottom() + 4),
+                QPointF(x - 8, track_rect.bottom() + 22),
+                QPointF(x + 8, track_rect.bottom() + 22),
+            ]
+            polygon = QPolygon()
+            for pt in points:
+                polygon.append(pt.toPoint())
+            painter.setBrush(color)
+            painter.setPen(Qt.black)
+            painter.drawPolygon(polygon)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            idx = self._hit_test(event.position())
+            if idx is None:
+                self._add_stop(event.position())
+            else:
+                self._drag_index = idx
+        elif event.button() == Qt.RightButton:
+            idx = self._hit_test(event.position())
+            if idx not in (None, 0, len(self._stops) - 1):
+                self._stops.pop(idx)
+                self.stopsChanged.emit(self.stops())
+                self.update()
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._drag_index is None:
+            return super().mouseMoveEvent(event)
+        self._move_stop(self._drag_index, event.position())
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        self._drag_index = None
+        super().mouseReleaseEvent(event)
+
+    def _hit_test(self, pos: QPointF) -> int | None:
+        rect = self.rect().adjusted(12, 12, -12, -26)
+        for idx, (stop_pos, color) in enumerate(self._stops):
+            x = rect.left() + stop_pos * rect.width()
+            triangle = QRectF(x - 10, rect.bottom(), 20, 24)
+            if triangle.contains(pos):
+                return idx
+        return None
+
+    def _add_stop(self, pos: QPointF):
+        rect = self.rect().adjusted(12, 12, -12, -26)
+        t = float(max(0.0, min(1.0, (pos.x() - rect.left()) / rect.width())))
+        color = QColor.fromHsvF(t, 1.0, 1.0)
+        self._stops.append((t, color))
+        self._stops.sort(key=lambda s: s[0])
+        self.stopsChanged.emit(self.stops())
+        self.update()
+
+    def _move_stop(self, idx: int, pos: QPointF):
+        rect = self.rect().adjusted(12, 12, -12, -26)
+        t = float(max(0.0, min(1.0, (pos.x() - rect.left()) / rect.width())))
+        if idx == 0:
+            t = 0.0
+        elif idx == len(self._stops) - 1:
+            t = 1.0
+        else:
+            left = self._stops[idx - 1][0] + 0.01
+            right = self._stops[idx + 1][0] - 0.01
+            t = min(right, max(left, t))
+        color = self._stops[idx][1]
+        self._stops[idx] = (t, color)
+        self._stops.sort(key=lambda s: s[0])
+        self.stopsChanged.emit(self.stops())
+        self.update()
+class AdjustmentPanel(QWidget):
+    GROUPS = [
+        {
+            "name": "Light",
+            "icon": "☀",
+            "tabs": [
+                "Levels",
+                "White Balance",
+                "Brightness / Contrast",
+                "Exposure",
+                "Shadows / Highlights",
+                "Vibrance",
+                "Posterize",
+            ],
+        },
+        {
+            "name": "Color",
+            "icon": "⚪⚪⚪",
+            "tabs": [
+                "HSL",
+                "Recolor",
+                "Black & White",
+                "Selective Color",
+                "Color Balance",
+                "White Balance",
+            ],
+        },
+        {
+            "name": "Tone",
+            "icon": "○",
+            "tabs": [
+                "Curves",
+                "Channel Mixer",
+                "Gradient Map",
+                "Split Toning",
+            ],
+        },
+        {
+            "name": "Geometry",
+            "icon": "▢",
+            "tabs": [
+                "Normals",
+            ],
+        },
+        {
+            "name": "FX",
+            "icon": "fx",
+            "tabs": [
+                "Lens Filter",
+            ],
+        },
+    ]
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+
+        self._group_stack = QStackedWidget(self)
+        self._group_sections: dict[tuple[str, str], CollapsibleSection] = {}
+
+        main_layout = QVBoxLayout(self)
+        main_layout.setContentsMargins(8, 8, 8, 8)
+        main_layout.setSpacing(8)
+
+        # Group bar (horizontal icons)
+        group_layout = QHBoxLayout()
+        group_layout.setSpacing(6)
+        group_layout.addStretch(1)
+        self._group_button_group = QButtonGroup(self)
+        self._group_button_group.buttonClicked.connect(self._on_group_button_clicked)
+
+        for idx, group in enumerate(self.GROUPS):
+            btn = QToolButton(self)
+            btn.setText(group["icon"])
+            btn.setToolTip(group["name"])
+            btn.setCheckable(True)
+            btn.setAutoExclusive(True)
+            btn.setMinimumSize(36, 36)
+            btn.setIconSize(QSize(24, 24))
+            self._group_button_group.addButton(btn)
+            self._group_button_group.setId(btn, idx)
+            group_layout.addWidget(btn)
+        group_layout.addStretch(1)
+        main_layout.addLayout(group_layout)
+
+        # Header row
+        header = QHBoxLayout()
+        header.setSpacing(6)
+        self.btn_add_preset = QPushButton("Add Preset")
+        self.btn_merge = QPushButton("Merge")
+        self.btn_delete = QPushButton("Delete")
+        self.btn_reset = QPushButton("Reset")
+        header.addWidget(self.btn_add_preset)
+        header.addWidget(self.btn_merge)
+        header.addWidget(self.btn_delete)
+        header.addWidget(self.btn_reset)
+        header.addStretch(1)
+        main_layout.addLayout(header)
+
+        # Group pages
+        for group in self.GROUPS:
+            group_widget = QWidget()
+            vbox = QVBoxLayout(group_widget)
+            vbox.setContentsMargins(0, 0, 0, 0)
+            vbox.setSpacing(6)
+            for tab_name in group["tabs"]:
+                section = CollapsibleSection(tab_name, self, start_collapsed=False)
+                placeholder = self._create_placeholder(tab_name)
+                section.content_layout().addWidget(placeholder)
+                self._group_sections[(group["name"], tab_name)] = section
+                vbox.addWidget(section)
+            vbox.addStretch(1)
+            self._group_stack.addWidget(group_widget)
+
+        main_layout.addWidget(self._group_stack, 1)
+
+        # Footer
+        footer = QHBoxLayout()
+        footer.setSpacing(6)
+        footer.addWidget(QLabel("Opacity"))
+        self.opacity_combo = QComboBox()
+        for i in range(0, 101, 10):
+            self.opacity_combo.addItem(f"{i}%", i)
+        self.opacity_combo.setCurrentIndex(10)  # 100%
+        footer.addWidget(self.opacity_combo)
+
+        footer.addWidget(QLabel("Blend Mode"))
+        self.blend_mode_combo = QComboBox()
+        for mode in ["Normal", "Screen", "Multiply", "Overlay", "Soft Light", "Hard Light"]:
+            self.blend_mode_combo.addItem(mode)
+        footer.addStretch(1)
+        self.gear_button = QToolButton()
+        self.gear_button.setText("⚙")
+        footer.addWidget(self.gear_button)
+        main_layout.addLayout(footer)
+
+        # Default selection
+        first_btn = self._group_button_group.button(0)
+        if first_btn:
+            first_btn.setChecked(True)
+            self._group_stack.setCurrentIndex(0)
+
+    def _on_group_button_clicked(self, button):
+        index = self._group_button_group.id(button)
+        if index >= 0:
+            self._group_stack.setCurrentIndex(index)
+
+    def _create_placeholder(self, tab_name: str) -> QWidget:
+        placeholder = QWidget()
+        pv = QVBoxLayout(placeholder)
+        pv.setContentsMargins(8, 8, 8, 8)
+        desc = QLabel(f"{tab_name} controls coming soon.")
+        desc.setWordWrap(True)
+        pv.addWidget(desc)
+        pv.addStretch(1)
+        return placeholder
+
+    def set_tab_content(self, group_name: str, tab_name: str, widget: QWidget):
+        section = self._group_sections.get((group_name, tab_name))
+        if section is None:
+            return
+        layout = section.content_layout()
+        while layout.count():
+            item = layout.takeAt(0)
+            w = item.widget()
+            if w:
+                w.setParent(None)
+        layout.addWidget(widget)
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -334,7 +1039,7 @@ class MainWindow(QMainWindow):
         self._current_pixmap: QPixmap | None = None
         self._preview_base_image: QImage | None = None
 
-        self._image_cache: dict[str, dict] = {}   # path -> {"full": QImage, "preview": QImage}
+        self._image_cache: dict[str, dict] = {}   # path -> {"full": QImage|None, "preview": QImage, "mtime": float}
         self._image_params: dict[str, dict] = {}  # path -> params
         self._image_parents: dict[str, QTreeWidgetItem] = {}
         self._edits: dict[str, dict] = {}         # for .lrc export
@@ -342,6 +1047,10 @@ class MainWindow(QMainWindow):
 
         self._project_path: str | None = None
         self._project_root: str | None = None
+        self._preview_long_edge = 2048
+
+        self._fs_using_fullres = False
+        self._fs_prev_preview_state: tuple | None = None
 
         # current parameters (Light + Color tabs)
         self._current_params = {
@@ -355,32 +1064,69 @@ class MainWindow(QMainWindow):
             "temperature": 128,
             "tint": 128,
             "vibrance": 128,
+            "brightness": 128,
+            "posterize_levels": 4,
+            "hsl_hue": 0,
+            "hsl_saturation": 0,
+            "hsl_luminance": 0,
+            "recolor_hue": 0,
+            "recolor_saturation": 0,
+            "recolor_lightness": 0,
+            "bw_red": 0,
+            "bw_yellow": 0,
+            "bw_green": 0,
+            "bw_cyan": 0,
+            "bw_blue": 0,
+            "bw_magenta": 0,
+            "selective_cyan": 0,
+            "selective_magenta": 0,
+            "selective_yellow": 0,
+            "selective_black": 0,
+            "color_balance_cyan_red": 0,
+            "color_balance_magenta_green": 0,
+            "color_balance_yellow_blue": 0,
+            "geometry_rotation": 0,
+            "geometry_scale": 100,
+            "fx_noise": 0,
+            "fx_density": 50,
+            "fx_color": "#ff8a3b",
         }
+        self._gradient_map_stops: list[tuple[float, str]] = [
+            (0.0, "#ff4b4b"),
+            (0.5, "#57d1ff"),
+            (1.0, "#4bff88"),
+        ]
 
         # autosave
         self._autosave_interval_min = 5
         self._autosave_timer = QTimer(self)
         self._autosave_timer.timeout.connect(self._on_autosave_timer)
         self._update_autosave_timer()
+
+        # preview / histogram timers
+        self._render_timer = QTimer(self)
+        self._render_timer.setSingleShot(True)
+        self._render_timer.timeout.connect(self._render_current_params)
                 # --- zoom / pan state ---
         self._zoom_mode = "fit"   # "fit" or "manual"
         self._zoom_factor = 1.0   # 1.0 = 100%
-        self._dragging = False
-        self._drag_last_pos = QPoint()
 
         # ---------- Central image area ----------
-                # ---------- Central image area + zoom toolbar ----------
-        self.image_display = QLabel("No Image Loaded")
-        self.image_display.setAlignment(Qt.AlignCenter)
-        self.image_display.setMinimumSize(200, 200)
-        self.image_display.setObjectName("imageDisplay")
+        self._using_opengl = bool(GLImageView and GLImageView.is_supported())
+        if self._using_opengl:
+            try:
+                self.image_view = GLImageView(self)
+                print("[Preview] Using OpenGL preview")
+            except Exception as e:
+                print("[OpenGL] Failed to initialize preview, using software fallback:", e)
+                self.image_view = SoftwareImageView(self)
+                self._using_opengl = False
+        else:
+            self.image_view = SoftwareImageView(self)
+            self._using_opengl = False
+            print("[Preview] Using software preview (OpenGL disabled)")
 
-        # Scroll area to allow panning
-        self.image_scroll = QScrollArea()
-        self.image_scroll.setFrameShape(QFrame.NoFrame)
-        self.image_scroll.setWidgetResizable(False)
-        self.image_scroll.setWidget(self.image_display)
-        self.image_scroll.setAlignment(Qt.AlignCenter)
+        self.image_view.setObjectName("imageDisplay")
 
         # DxO-style zoom toolbar
         self.image_toolbar = QWidget()
@@ -407,16 +1153,15 @@ class MainWindow(QMainWindow):
         tb.addStretch(1)
 
         self.vbox.addWidget(self.image_toolbar, 0)
-        self.vbox.addWidget(self.image_scroll, 1)
-                # zoom button signals
+        self.vbox.addWidget(self.image_view, 1)
+
+        # zoom button signals
         self.zoom_fit_btn.clicked.connect(self._on_zoom_fit)
         self.zoom_100_btn.clicked.connect(self._on_zoom_100)
         self.zoom_in_btn.clicked.connect(self._on_zoom_in)
         self.zoom_out_btn.clicked.connect(self._on_zoom_out)
 
-        # drag-to-pan on the image
-        self.image_display.installEventFilter(self)
-
+        self.image_view.zoomChanged.connect(self._on_view_zoom_changed)
 
         # ---------- Bottom filmstrip ----------
         self.thumbs = QListWidget()
@@ -481,20 +1226,28 @@ class MainWindow(QMainWindow):
             | QDockWidget.DockWidgetFloatable
         )
 
+        self._init_icon_loader()
+
         self.adjust_tabs = QTabWidget()
         self.adjust_tabs.setObjectName("rightTabs")
         self.adjust_tabs.setTabPosition(QTabWidget.North)
         self.adjust_tabs.setIconSize(QSize(32, 32))
         self.adjust_tabs.setDocumentMode(True)
 
-        self._build_light_tab()
         self._build_color_tab()
         self._build_detail_tab()
         self._build_geometry_tab()
         self._build_fx_tab()
         self._build_metadata_tab()
 
-        self.right_dock.setWidget(self.adjust_tabs)
+        self.adjust_panel = AdjustmentPanel(self)
+        splitter = QSplitter(Qt.Vertical)
+        splitter.addWidget(self.hist_widget)
+        splitter.addWidget(self.adjust_panel)
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 2)
+        self.right_dock.setWidget(splitter)
+        self._init_adjustment_panel_content()
 
         # ---------- Left dock: active edit + folders ----------
         self.left_dock = QDockWidget("Panels", self)
@@ -552,52 +1305,47 @@ class MainWindow(QMainWindow):
         # ---------- zoom helpers ----------
 
     def _set_zoom(self, factor: float, mode: str = "manual"):
-        if self._current_pixmap is None:
+        if not self.image_view.has_image():
             return
 
-        factor = max(0.1, min(8.0, factor))  # clamp 10%–800%
-        self._zoom_factor = factor
-        self._zoom_mode = mode
+        if mode == "fit":
+            self._zoom_mode = "fit"
+            self._zoom_factor = self.image_view.fit_to_window()
+        else:
+            factor = max(0.1, min(8.0, factor))
+            self._zoom_mode = "manual"
+            self._zoom_factor = self.image_view.set_manual_zoom(factor)
         self._update_zoom_label()
-        self._rescale_preview()
 
     def _update_zoom_label(self):
-        if self._current_pixmap is None:
+        if not self.image_view.has_image():
             self.zoom_label.setText("—")
             return
 
-        # compute % from displayed pixmap size vs. original preview
-        pm = self.image_display.pixmap()
-        if pm is not None and not pm.isNull():
-            ratio = pm.width() / self._current_pixmap.width()
-        else:
-            ratio = self._zoom_factor
+        pct = int(round(self._zoom_factor * 100))
+        self.zoom_label.setText(f"{pct}%")
 
-        pct = int(round(ratio * 100))
-        if self._zoom_mode == "fit":
-            self.zoom_label.setText(f"{pct}%")
-        else:
-            self.zoom_label.setText(f"{pct}%")
+    def _on_view_zoom_changed(self, factor: float):
+        self._zoom_factor = factor
+        self._update_zoom_label()
 
     def _on_zoom_in(self):
-        if self._current_pixmap is None:
+        if not self.image_view.has_image():
             return
         self._set_zoom(self._zoom_factor * 1.25, mode="manual")
 
     def _on_zoom_out(self):
-        if self._current_pixmap is None:
+        if not self.image_view.has_image():
             return
         self._set_zoom(self._zoom_factor / 1.25, mode="manual")
 
     def _on_zoom_fit(self):
-        if self._current_pixmap is None:
+        if not self.image_view.has_image():
             return
-        self._zoom_mode = "fit"
-        self._rescale_preview()
-        self._update_zoom_label()
+        self._set_zoom(self._zoom_factor, mode="fit")
 
     def _on_zoom_100(self):
-        if self._current_pixmap is None:
+        if not self.image_view.has_image():
             return
         self._set_zoom(1.0, mode="manual")
 
@@ -630,7 +1378,19 @@ class MainWindow(QMainWindow):
         self.act_save_project = file_menu.addAction("&Save Project")
         self.act_save_project.setShortcut("Ctrl+S")
         self.act_save_project.triggered.connect(self.export_lrc)
-        
+
+    def _init_icon_loader(self):
+        icons_dir = os.path.join(os.path.dirname(__file__), "icons")
+
+        def load_icon(name: str, fallback_role=None):
+            path = os.path.join(icons_dir, name)
+            if os.path.exists(path):
+                return QIcon(path)
+            if fallback_role is not None:
+                return self.style().standardIcon(fallback_role)
+            return QIcon()
+
+        self._load_icon = load_icon
 
     # ---- right dock tabs ---- #
 
@@ -644,6 +1404,635 @@ class MainWindow(QMainWindow):
         row.addWidget(slider, 1)
         row.addWidget(value_label)
         return slider, value_label, row
+
+    def _create_labeled_slider(self, title: str, min_value: int, max_value: int, default: int, suffix: str = "", on_change=None):
+        row = QHBoxLayout()
+        row.setSpacing(6)
+        label_title = QLabel(title)
+        slider = QSlider(Qt.Horizontal)
+        slider.setRange(min_value, max_value)
+        slider.setValue(default)
+        value_label = QLabel(f"{default}{suffix}")
+
+        def _update_text(val):
+            value_label.setText(f"{val}{suffix}")
+            if on_change:
+                on_change(val)
+
+        slider.valueChanged.connect(_update_text)
+        slider.sliderReleased.connect(self._on_edit_committed)
+
+        row.addWidget(label_title)
+        row.addWidget(slider, 1)
+        row.addWidget(value_label)
+        return row, slider
+
+    def _init_adjustment_panel_content(self):
+        self.adjust_panel.set_tab_content("Light", "Levels", self._create_levels_tab())
+        self.adjust_panel.set_tab_content(
+            "Light", "White Balance", self._create_light_white_balance_tab()
+        )
+        self.adjust_panel.set_tab_content(
+            "Light", "Brightness / Contrast", self._create_light_brightness_tab()
+        )
+        self.adjust_panel.set_tab_content(
+            "Light", "Exposure", self._create_light_exposure_tab()
+        )
+        self.adjust_panel.set_tab_content(
+            "Light", "Shadows / Highlights", self._create_light_shadows_tab()
+        )
+        self.adjust_panel.set_tab_content(
+            "Light", "Vibrance", self._create_light_vibrance_tab()
+        )
+        self.adjust_panel.set_tab_content("Light", "Posterize", self._create_light_posterize_tab())
+        self.adjust_panel.set_tab_content("Color", "HSL", self._create_color_hsl_tab())
+        self.adjust_panel.set_tab_content("Color", "Recolor", self._create_color_recolor_tab())
+        self.adjust_panel.set_tab_content("Color", "Black & White", self._create_color_bw_tab())
+        self.adjust_panel.set_tab_content("Color", "Selective Color", self._create_color_selective_tab())
+        self.adjust_panel.set_tab_content("Color", "Color Balance", self._create_color_balance_tab())
+        self.adjust_panel.set_tab_content("Tone", "Curves", self._create_tone_curves_tab())
+        self.adjust_panel.set_tab_content("Tone", "Channel Mixer", self._create_tone_channel_mixer_tab())
+        self.adjust_panel.set_tab_content("Tone", "Gradient Map", self._create_tone_gradient_map_tab())
+        self.adjust_panel.set_tab_content("Tone", "Split Toning", self._create_tone_split_tone_tab())
+        self.adjust_panel.set_tab_content("Geometry", "Normals", self._create_geometry_normals_tab())
+        self.adjust_panel.set_tab_content("FX", "Lens Filter", self._create_fx_lens_filter_tab())
+
+    def _create_levels_tab(self) -> QWidget:
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(8)
+
+        channel_row = QHBoxLayout()
+        channel_row.setSpacing(8)
+        lbl_model = QLabel("Color Model")
+        self.levels_model_combo = QComboBox()
+        self.levels_model_combo.addItems(["RGB", "Red", "Green", "Blue", "Alpha"])
+        lbl_channel = QLabel("Channel")
+        self.levels_channel_combo = QComboBox()
+        self.levels_channel_combo.addItems(["Master", "Red", "Green", "Blue", "Alpha"])
+        channel_row.addWidget(lbl_model)
+        channel_row.addWidget(self.levels_model_combo)
+        channel_row.addSpacing(12)
+        channel_row.addWidget(lbl_channel)
+        channel_row.addWidget(self.levels_channel_combo)
+        channel_row.addStretch(1)
+        layout.addLayout(channel_row)
+
+        layout.addLayout(self._create_percentage_slider_row("Black Level", 0))
+        layout.addLayout(self._create_percentage_slider_row("White Level", 100))
+        layout.addLayout(self._create_gamma_slider_row("Gamma", 1.0))
+        layout.addLayout(self._create_percentage_slider_row("Output Black Level", 0))
+        layout.addLayout(self._create_percentage_slider_row("Output White Level", 100))
+
+        layout.addStretch(1)
+        return widget
+
+    def _create_light_white_balance_tab(self) -> QWidget:
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(12)
+
+        temp_row = QHBoxLayout()
+        temp_row.setSpacing(8)
+        lbl_temp = QLabel("White Balance")
+        self.temperature_slider = QSlider(Qt.Horizontal)
+        self.temperature_slider.setRange(0, 255)
+        self.temperature_slider.setValue(self._current_params.get("temperature", 128))
+        self.temperature_value = QLabel(f"Temp: {self.temperature_slider.value()}")
+        self.temperature_slider.valueChanged.connect(self._on_temperature_changed)
+        self.temperature_slider.sliderReleased.connect(self._on_edit_committed)
+        temp_row.addWidget(lbl_temp)
+        temp_row.addWidget(self.temperature_slider, 1)
+        temp_row.addWidget(self.temperature_value)
+        layout.addLayout(temp_row)
+
+        tint_row = QHBoxLayout()
+        tint_row.setSpacing(8)
+        lbl_tint = QLabel("Tint")
+        self.tint_slider = QSlider(Qt.Horizontal)
+        self.tint_slider.setRange(0, 255)
+        self.tint_slider.setValue(self._current_params.get("tint", 128))
+        self.tint_value = QLabel(f"Tint: {self.tint_slider.value()}")
+        self.tint_slider.valueChanged.connect(self._on_tint_changed)
+        self.tint_slider.sliderReleased.connect(self._on_edit_committed)
+        tint_row.addWidget(lbl_tint)
+        tint_row.addWidget(self.tint_slider, 1)
+        tint_row.addWidget(self.tint_value)
+        layout.addLayout(tint_row)
+
+        picker_btn = QPushButton("Picker")
+        picker_btn.clicked.connect(self._on_white_balance_picker)
+        picker_btn.setFixedWidth(120)
+        layout.addWidget(picker_btn, alignment=Qt.AlignLeft)
+        layout.addStretch(1)
+        return widget
+
+    def _create_light_brightness_tab(self) -> QWidget:
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(10)
+
+        self.brightness_slider, self.brightness_value, bright_row = self._make_slider_row("Brightness")
+        self.brightness_slider.setValue(self._current_params.get("brightness", 128))
+        self.brightness_value.setText(f"Brightness: {self.brightness_slider.value()}")
+        self.brightness_slider.valueChanged.connect(self._on_brightness_changed)
+        self.brightness_slider.sliderReleased.connect(self._on_edit_committed)
+        layout.addLayout(bright_row)
+
+        self.contrast_slider, self.contrast_value, con_row = self._make_slider_row("Contrast")
+        self.contrast_slider.setValue(self._current_params.get("contrast", 128))
+        self.contrast_value.setText(f"Contrast: {self.contrast_slider.value()}")
+        self.contrast_slider.valueChanged.connect(self._on_contrast_changed)
+        self.contrast_slider.sliderReleased.connect(self._on_edit_committed)
+        layout.addLayout(con_row)
+
+        self.brightness_linear_checkbox = QCheckBox("Linear")
+        layout.addWidget(self.brightness_linear_checkbox)
+        layout.addStretch(1)
+        return widget
+
+    def _create_light_exposure_tab(self) -> QWidget:
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(8)
+        self.exposure_slider, self.exposure_value, exp_row = self._make_slider_row("Exposure")
+        self.exposure_slider.setValue(self._current_params.get("exposure", 128))
+        self.exposure_value.setText(f"Exposure: {self.exposure_slider.value()}")
+        self.exposure_slider.valueChanged.connect(self._on_exposure_changed)
+        self.exposure_slider.sliderReleased.connect(self._on_edit_committed)
+        layout.addLayout(exp_row)
+        layout.addStretch(1)
+        return widget
+
+    def _create_light_shadows_tab(self) -> QWidget:
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(8)
+
+        self.shadows_slider, self.shadows_value, sh_row = self._make_slider_row("Shadows")
+        self.shadows_slider.setValue(self._current_params.get("shadows", 128))
+        self.shadows_value.setText(f"Shadows: {self.shadows_slider.value()}")
+        self.shadows_slider.valueChanged.connect(self._on_shadows_changed)
+        self.shadows_slider.sliderReleased.connect(self._on_edit_committed)
+        layout.addLayout(sh_row)
+
+        self.highlights_slider, self.highlights_value, hi_row = self._make_slider_row("Highlights")
+        self.highlights_slider.setValue(self._current_params.get("highlights", 128))
+        self.highlights_value.setText(f"Highlights: {self.highlights_slider.value()}")
+        self.highlights_slider.valueChanged.connect(self._on_highlights_changed)
+        self.highlights_slider.sliderReleased.connect(self._on_edit_committed)
+        layout.addLayout(hi_row)
+
+        self.whites_slider, self.whites_value, wh_row = self._make_slider_row("Whites")
+        self.whites_slider.setValue(self._current_params.get("whites", 128))
+        self.whites_value.setText(f"Whites: {self.whites_slider.value()}")
+        self.whites_slider.valueChanged.connect(self._on_whites_changed)
+        self.whites_slider.sliderReleased.connect(self._on_edit_committed)
+        layout.addLayout(wh_row)
+
+        self.blacks_slider, self.blacks_value, bl_row = self._make_slider_row("Blacks")
+        self.blacks_slider.setValue(self._current_params.get("blacks", 128))
+        self.blacks_value.setText(f"Blacks: {self.blacks_slider.value()}")
+        self.blacks_slider.valueChanged.connect(self._on_blacks_changed)
+        self.blacks_slider.sliderReleased.connect(self._on_edit_committed)
+        layout.addLayout(bl_row)
+
+        layout.addStretch(1)
+        return widget
+
+    def _create_light_vibrance_tab(self) -> QWidget:
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(8)
+
+        self.vibrance_slider, self.vibrance_value, vib_row = self._make_slider_row("Vibrance")
+        self.vibrance_slider.setValue(self._current_params.get("vibrance", 128))
+        self.vibrance_value.setText(f"Vibrance: {self.vibrance_slider.value()}")
+        self.vibrance_slider.valueChanged.connect(self._on_vibrance_changed)
+        self.vibrance_slider.sliderReleased.connect(self._on_edit_committed)
+        layout.addLayout(vib_row)
+
+        self.saturation_slider, self.saturation_value, sat_row = self._make_slider_row("Saturation")
+        self.saturation_slider.setValue(self._current_params.get("saturation", 128))
+        self.saturation_value.setText(f"Saturation: {self.saturation_slider.value()}")
+        self.saturation_slider.valueChanged.connect(self._on_saturation_changed)
+        self.saturation_slider.sliderReleased.connect(self._on_edit_committed)
+        layout.addLayout(sat_row)
+
+        layout.addStretch(1)
+        return widget
+
+    def _create_light_posterize_tab(self) -> QWidget:
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(8)
+
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        lbl = QLabel("Posterize Levels")
+        self.posterize_slider = QSlider(Qt.Horizontal)
+        self.posterize_slider.setRange(2, 32)
+        self.posterize_slider.setValue(self._current_params.get("posterize_levels", 4))
+        self.posterize_value = QLabel(f"Levels: {self.posterize_slider.value()}")
+        self.posterize_slider.valueChanged.connect(self._on_posterize_levels_changed)
+        self.posterize_slider.sliderReleased.connect(self._on_edit_committed)
+        row.addWidget(lbl)
+        row.addWidget(self.posterize_slider, 1)
+        row.addWidget(self.posterize_value)
+        layout.addLayout(row)
+        layout.addStretch(1)
+        return widget
+
+    def _create_color_hsl_tab(self) -> QWidget:
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(10)
+
+        self.hsl_hsv_checkbox = QCheckBox("HSV Mode")
+        layout.addWidget(self.hsl_hsv_checkbox)
+
+        self.hsl_color_wheel = ColorWheelWidget(self)
+        self.hsl_color_wheel.hueChanged.connect(self._on_color_wheel_hue_changed)
+        self.hsl_color_wheel.set_hue(self._current_params.get("hsl_hue", 0))
+        layout.addWidget(self.hsl_color_wheel)
+
+        swatch_row = QHBoxLayout()
+        swatch_colors = [
+            ("R", "#ff4b4b"),
+            ("O", "#ff8c3b"),
+            ("Y", "#ffc93b"),
+            ("G", "#58d16a"),
+            ("C", "#42c5d9"),
+            ("B", "#3a7bff"),
+            ("M", "#d84bff"),
+        ]
+        for text, color in swatch_colors:
+            btn = QToolButton()
+            btn.setFixedSize(28, 28)
+            btn.setStyleSheet(f"background-color: {color}; border-radius: 14px;")
+            btn.setToolTip(text)
+            swatch_row.addWidget(btn)
+        swatch_row.addStretch(1)
+        picker_btn = QPushButton("Picker")
+        picker_btn.setFixedWidth(80)
+        swatch_row.addWidget(picker_btn)
+        layout.addLayout(swatch_row)
+
+        row, slider = self._create_labeled_slider(
+            "Hue Shift", -180, 180, self._current_params.get("hsl_hue", 0), "°", self._on_hsl_hue_changed
+        )
+        self.hsl_hue_slider = slider
+        layout.addLayout(row)
+
+        row, slider = self._create_labeled_slider(
+            "Saturation Shift", -100, 100, self._current_params.get("hsl_saturation", 0), "%", self._on_hsl_saturation_changed
+        )
+        self.hsl_saturation_slider = slider
+        layout.addLayout(row)
+
+        row, slider = self._create_labeled_slider(
+            "Luminosity Shift", -100, 100, self._current_params.get("hsl_luminance", 0), "%", self._on_hsl_luminance_changed
+        )
+        self.hsl_luminance_slider = slider
+        layout.addLayout(row)
+
+        layout.addStretch(1)
+        return widget
+
+    def _create_color_recolor_tab(self) -> QWidget:
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(10)
+
+        row, slider = self._create_labeled_slider(
+            "Hue", -180, 180, self._current_params.get("recolor_hue", 0), "°", self._on_recolor_hue_changed
+        )
+        self.recolor_hue_slider = slider
+        layout.addLayout(row)
+
+        row, slider = self._create_labeled_slider(
+            "Saturation", -100, 100, self._current_params.get("recolor_saturation", 0), "%", self._on_recolor_saturation_changed
+        )
+        self.recolor_saturation_slider = slider
+        layout.addLayout(row)
+
+        row, slider = self._create_labeled_slider(
+            "Lightness", -100, 100, self._current_params.get("recolor_lightness", 0), "%", self._on_recolor_lightness_changed
+        )
+        self.recolor_lightness_slider = slider
+        layout.addLayout(row)
+
+        layout.addStretch(1)
+        return widget
+
+    def _create_color_bw_tab(self) -> QWidget:
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(8)
+
+        colors = [
+            ("Red", "bw_red"),
+            ("Yellow", "bw_yellow"),
+            ("Green", "bw_green"),
+            ("Cyan", "bw_cyan"),
+            ("Blue", "bw_blue"),
+            ("Magenta", "bw_magenta"),
+        ]
+        for label_text, key in colors:
+            row, slider = self._create_labeled_slider(
+                label_text, -100, 100, self._current_params.get(key, 0), "%", lambda val, k=key: self._on_bw_slider_changed(k, val)
+            )
+            layout.addLayout(row)
+
+        picker_btn = QPushButton("Picker")
+        picker_btn.setFixedWidth(90)
+        layout.addWidget(picker_btn, alignment=Qt.AlignLeft)
+        layout.addStretch(1)
+        return widget
+
+    def _create_color_selective_tab(self) -> QWidget:
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(8)
+
+        top_row = QHBoxLayout()
+        top_row.addWidget(QLabel("Color"))
+        self.selective_color_combo = QComboBox()
+        self.selective_color_combo.addItems(
+            ["Reds", "Yellows", "Greens", "Cyans", "Blues", "Magentas", "Whites", "Neutrals", "Blacks"]
+        )
+        top_row.addWidget(self.selective_color_combo, 1)
+        self.selective_relative_checkbox = QCheckBox("Relative")
+        top_row.addWidget(self.selective_relative_checkbox)
+        layout.addLayout(top_row)
+
+        row, slider = self._create_labeled_slider(
+            "Cyan", -100, 100, self._current_params.get("selective_cyan", 0), "%", self._on_selective_cyan_changed
+        )
+        self.selective_c_slider = slider
+        layout.addLayout(row)
+
+        row, slider = self._create_labeled_slider(
+            "Magenta", -100, 100, self._current_params.get("selective_magenta", 0), "%", self._on_selective_magenta_changed
+        )
+        self.selective_m_slider = slider
+        layout.addLayout(row)
+
+        row, slider = self._create_labeled_slider(
+            "Yellow", -100, 100, self._current_params.get("selective_yellow", 0), "%", self._on_selective_yellow_changed
+        )
+        self.selective_y_slider = slider
+        layout.addLayout(row)
+
+        row, slider = self._create_labeled_slider(
+            "Black", -100, 100, self._current_params.get("selective_black", 0), "%", self._on_selective_black_changed
+        )
+        self.selective_k_slider = slider
+        layout.addLayout(row)
+        layout.addStretch(1)
+        return widget
+
+    def _create_color_balance_tab(self) -> QWidget:
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(8)
+
+        top_row = QHBoxLayout()
+        top_row.addWidget(QLabel("Tonal Range"))
+        self.color_balance_range = QComboBox()
+        self.color_balance_range.addItems(["Shadows", "Midtones", "Highlights"])
+        top_row.addWidget(self.color_balance_range, 1)
+        layout.addLayout(top_row)
+
+        row, slider = self._create_labeled_slider(
+            "Cyan / Red", -100, 100, self._current_params.get("color_balance_cyan_red", 0), "%", self._on_color_balance_cyan_changed
+        )
+        self.cb_cyan_slider = slider
+        layout.addLayout(row)
+
+        row, slider = self._create_labeled_slider(
+            "Magenta / Green", -100, 100, self._current_params.get("color_balance_magenta_green", 0), "%", self._on_color_balance_magenta_changed
+        )
+        self.cb_magenta_slider = slider
+        layout.addLayout(row)
+
+        row, slider = self._create_labeled_slider(
+            "Yellow / Blue", -100, 100, self._current_params.get("color_balance_yellow_blue", 0), "%", self._on_color_balance_yellow_changed
+        )
+        self.cb_yellow_slider = slider
+        layout.addLayout(row)
+
+        self.color_balance_preserve = QCheckBox("Preserve Luminosity")
+        layout.addWidget(self.color_balance_preserve)
+        layout.addStretch(1)
+        return widget
+
+    def _create_tone_curves_tab(self) -> QWidget:
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(8)
+
+        self.curves_widget = CurvesWidget(self)
+        layout.addWidget(self.curves_widget)
+
+        dropdown_row = QHBoxLayout()
+        dropdown_row.addWidget(QLabel("Color Model"))
+        self.curve_model_combo = QComboBox()
+        self.curve_model_combo.addItems(["RGB", "CMYK", "LAB", "Grey"])
+        dropdown_row.addWidget(self.curve_model_combo)
+        dropdown_row.addSpacing(12)
+        dropdown_row.addWidget(QLabel("Channel"))
+        self.curve_channel_combo = QComboBox()
+        self.curve_channel_combo.addItems(["Master", "Red", "Green", "Blue", "Alpha"])
+        dropdown_row.addWidget(self.curve_channel_combo)
+        dropdown_row.addStretch(1)
+        picker_btn = QPushButton("Picker")
+        picker_btn.setFixedWidth(80)
+        dropdown_row.addWidget(picker_btn)
+        layout.addLayout(dropdown_row)
+
+        numeric_row = QHBoxLayout()
+        for lbl in ["X", "Y", "Min", "Max"]:
+            numeric_row.addWidget(QLabel(f"{lbl}:"))
+            spin = QDoubleSpinBox()
+            spin.setRange(0.0, 1.0)
+            spin.setSingleStep(0.01)
+            spin.setValue(0.5 if lbl in ("X", "Y") else (0.0 if lbl == "Min" else 1.0))
+            numeric_row.addWidget(spin)
+        layout.addLayout(numeric_row)
+        layout.addStretch(1)
+        return widget
+
+    def _create_tone_channel_mixer_tab(self) -> QWidget:
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(8)
+
+        output_row = QHBoxLayout()
+        output_row.addWidget(QLabel("Output Model"))
+        self.channel_mixer_model = QComboBox()
+        self.channel_mixer_model.addItems(["RGB"])
+        output_row.addWidget(self.channel_mixer_model)
+        output_row.addSpacing(12)
+        output_row.addWidget(QLabel("Channel"))
+        self.channel_mixer_channel = QComboBox()
+        self.channel_mixer_channel.addItems(["Red", "Green", "Blue", "Alpha"])
+        output_row.addWidget(self.channel_mixer_channel)
+        layout.addLayout(output_row)
+
+        for label_text in ["Red", "Green", "Blue", "Alpha", "Offset"]:
+            row, slider = self._create_labeled_slider(
+                label_text, -200, 200, 0, "%", lambda val, lbl=label_text: self._on_channel_mixer_changed(lbl.lower(), val)
+            )
+            layout.addLayout(row)
+        layout.addStretch(1)
+        return widget
+
+    def _create_tone_gradient_map_tab(self) -> QWidget:
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(8)
+
+        self.gradient_editor = GradientStopEditor(self)
+        self.gradient_editor.set_stops(
+            [(pos, QColor(color)) for pos, color in self._gradient_map_stops]
+        )
+        self.gradient_editor.stopsChanged.connect(self._on_gradient_editor_changed)
+        layout.addWidget(self.gradient_editor)
+
+        control_row = QHBoxLayout()
+        for text in ["Insert", "Copy", "Reverse", "Delete"]:
+            btn = QPushButton(text)
+            control_row.addWidget(btn)
+        layout.addLayout(control_row)
+
+        layout.addStretch(1)
+        return widget
+
+    def _create_tone_split_tone_tab(self) -> QWidget:
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(8)
+
+        for name in ["Highlights Hue", "Highlights Saturation", "Shadows Hue", "Shadows Saturation", "Balance"]:
+            row, slider = self._create_labeled_slider(
+                name,
+                0 if "Saturation" in name or "Balance" in name else 0,
+                100 if "Saturation" in name or "Balance" in name else 360,
+                50 if "Balance" in name else 0,
+                "%" if "Saturation" in name or "Balance" in name else "°",
+            )
+        layout.addLayout(row)
+
+        layout.addStretch(1)
+        return widget
+
+    def _create_geometry_normals_tab(self) -> QWidget:
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(8)
+
+        row, slider = self._create_labeled_slider(
+            "Rotation", -180, 180, 0, "°", self._on_geometry_rotation_changed
+        )
+        self.geometry_rotation_slider = slider
+        layout.addLayout(row)
+
+        row, slider = self._create_labeled_slider(
+            "Scale", 0, 200, 100, "%", self._on_geometry_scale_changed
+        )
+        self.geometry_scale_slider = slider
+        layout.addLayout(row)
+
+        flips = QHBoxLayout()
+        self.flip_x_checkbox = QCheckBox("Flip X")
+        self.flip_y_checkbox = QCheckBox("Flip Y")
+        flips.addWidget(self.flip_x_checkbox)
+        flips.addWidget(self.flip_y_checkbox)
+        flips.addStretch(1)
+        layout.addLayout(flips)
+        layout.addStretch(1)
+        return widget
+
+    def _create_fx_lens_filter_tab(self) -> QWidget:
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(8)
+
+        self.fx_filter_button = QPushButton("Filter Color")
+        self.fx_filter_button.setFixedWidth(160)
+        self.fx_filter_button.clicked.connect(self._on_fx_color_clicked)
+        self._update_fx_color_button()
+        layout.addWidget(self.fx_filter_button, alignment=Qt.AlignLeft)
+
+        row, slider = self._create_labeled_slider(
+            "Noise", 0, 100, 0, "%", self._on_fx_noise_changed
+        )
+        layout.addLayout(row)
+
+        row, slider = self._create_labeled_slider(
+            "Optical Density", 0, 100, 50, "%", self._on_fx_density_changed
+        )
+        layout.addLayout(row)
+
+        self.fx_preserve_lum_checkbox = QCheckBox("Preserve Luminosity")
+        layout.addWidget(self.fx_preserve_lum_checkbox)
+        layout.addStretch(1)
+        return widget
+
+    def _create_percentage_slider_row(self, title: str, default: int) -> QHBoxLayout:
+        row = QHBoxLayout()
+        row.setSpacing(6)
+        label = QLabel(title)
+        slider = QSlider(Qt.Horizontal)
+        slider.setRange(0, 100)
+        slider.setValue(default)
+        spin = QSpinBox()
+        spin.setRange(0, 100)
+        spin.setSuffix("%")
+        spin.setValue(default)
+        slider.valueChanged.connect(spin.setValue)
+        spin.valueChanged.connect(slider.setValue)
+        row.addWidget(label)
+        row.addWidget(slider, 1)
+        row.addWidget(spin)
+        return row
+
+    def _create_gamma_slider_row(self, title: str, default: float) -> QHBoxLayout:
+        row = QHBoxLayout()
+        row.setSpacing(6)
+        label = QLabel(title)
+        slider = QSlider(Qt.Horizontal)
+        slider.setRange(10, 400)
+        slider.setValue(int(default * 100))
+        spin = QDoubleSpinBox()
+        spin.setRange(0.1, 4.0)
+        spin.setSingleStep(0.05)
+        spin.setValue(default)
+        slider.valueChanged.connect(lambda val: spin.setValue(val / 100.0))
+        spin.valueChanged.connect(lambda val: slider.setValue(int(val * 100)))
+        row.addWidget(label)
+        row.addWidget(slider, 1)
+        row.addWidget(spin)
+        return row
 
     def _build_light_tab(self):
         # sliders
@@ -690,10 +2079,9 @@ class MainWindow(QMainWindow):
         v.setContentsMargins(4, 4, 4, 4)
         v.setSpacing(6)
 
-        # Histogram section
-        hist_section = CollapsibleSection("Histogram", self)
-        hist_layout = hist_section.content_layout()
-        hist_layout.addWidget(self.hist_widget)
+        # Placeholder when histogram dock is closed
+        hist_section = CollapsibleSection("Histogram", self, start_collapsed=False)
+        hist_section.content_layout().addWidget(QLabel("Use the Histogram dock to view data."))
         v.addWidget(hist_section)
 
         # Basic adjustments
@@ -835,8 +2223,8 @@ class MainWindow(QMainWindow):
             self._current_params[key] = 128
 
         if self._preview_base_image is not None:
-            self._apply_edit_params_to_current_image(self._current_params)
-            self._on_edit_committed()
+            self._push_params_to_view()
+            self._schedule_render()
 
 
 
@@ -993,7 +2381,7 @@ class MainWindow(QMainWindow):
     # ------------- styling ------------- #
 
     def _apply_styles(self):
-        accent = "#00b4ff"
+        accent = "#646b6d"
 
         self.setStyleSheet(f"""
         QMainWindow {{
@@ -1462,10 +2850,8 @@ class MainWindow(QMainWindow):
             size_mb = 0.0
             modified_str = "—"
 
-        self._ensure_image_cached(path)
-        cache = self._image_cache.get(path)
-        if cache:
-            img = cache["full"]
+        img = self._ensure_full_image(path)
+        if img is not None:
             w = img.width()
             h = img.height()
             depth = img.depth()
@@ -1500,11 +2886,41 @@ class MainWindow(QMainWindow):
 
     # ---------- histogram update ----------
 
-    def _update_histogram(self):
-        if self._current_pixmap is None:
+    def _update_histogram_from_view(self, force: bool = False):
+        if not self.image_view.has_image():
             self.hist_widget.clear_histogram()
+            if self._preview_base_image is not None:
+                self._current_pixmap = QPixmap.fromImage(self._preview_base_image)
+                self.image_view.update_cpu_pixmap(self._current_pixmap)
+            else:
+                self._current_pixmap = None
+            return
+
+        is_valid = getattr(self.image_view, "isValid", lambda: True)
+        context_method = getattr(self.image_view, "context", None)
+        if context_method is None:
+            view_ready = True
         else:
-            self.hist_widget.set_image(self._current_pixmap.toImage())
+            view_ready = is_valid() and context_method() is not None
+        if not view_ready:
+            if force:
+                QTimer.singleShot(50, lambda f=True: self._update_histogram_from_view(f))
+            return
+
+        max_side = None if force else 512
+        img = self.image_view.capture_image(max_side=max_side)
+        if img.isNull():
+            if force and self._preview_base_image is not None:
+                self._current_pixmap = QPixmap.fromImage(self._preview_base_image)
+                self.image_view.update_cpu_pixmap(self._current_pixmap)
+                self.hist_widget.set_image(self._preview_base_image)
+            else:
+                QTimer.singleShot(50, lambda f=force: self._update_histogram_from_view(f))
+            return
+
+        self._current_pixmap = QPixmap.fromImage(img)
+        self.image_view.update_cpu_pixmap(self._current_pixmap)
+        self.hist_widget.set_image(img)
 
     # ---------- history tree context menu ----------
 
@@ -1640,8 +3056,7 @@ class MainWindow(QMainWindow):
 
         self.thumbs.clear()
         self.history_tree.clear()
-        self.image_display.clear()
-        self.image_display.setText("No Image Loaded")
+        self.image_view.clear_image()
 
         for slider, label, key in [
             (self.exposure_slider, self.exposure_value, "exposure"),
@@ -1667,6 +3082,56 @@ class MainWindow(QMainWindow):
 
     # ---------- fullscreen ----------
 
+    def _use_full_resolution_preview(self):
+        if self._fs_using_fullres:
+            return
+        path = self._current_path
+        if not path:
+            return
+        full_img = self._ensure_full_image(path)
+        if full_img is None or full_img.isNull():
+            return
+
+        self._fs_prev_preview_state = (
+            self._preview_base_image,
+            self._base_rgb,
+            self._base_lum,
+            self._L_norm,
+            self._tone_masks,
+        )
+
+        self._preview_base_image = full_img
+        self._base_rgb = None
+        self._base_lum = None
+        self._L_norm = None
+        self._tone_masks = {}
+        self._prepare_base_arrays()
+        self._apply_edit_params_to_current_image(self._current_params)
+        self._fs_using_fullres = True
+        self.statusBar().showMessage("Showing full-resolution preview", 2000)
+
+    def _restore_preview_resolution(self):
+        if not self._fs_using_fullres or not self._fs_prev_preview_state:
+            return
+        (
+            prev_image,
+            prev_rgb,
+            prev_lum,
+            prev_L,
+            prev_masks,
+        ) = self._fs_prev_preview_state
+        self._preview_base_image = prev_image
+        self._base_rgb = prev_rgb
+        self._base_lum = prev_lum
+        self._L_norm = prev_L
+        self._tone_masks = prev_masks or {}
+        if self._preview_base_image is not None:
+            if self._base_rgb is None or self._base_lum is None:
+                self._prepare_base_arrays()
+            self._apply_edit_params_to_current_image(self._current_params)
+        self._fs_prev_preview_state = None
+        self._fs_using_fullres = False
+
     def toggle_fullscreen(self, checked: bool = False):
         if not self._is_fullscreen_mode:
             self._is_fullscreen_mode = True
@@ -1691,6 +3156,7 @@ class MainWindow(QMainWindow):
             self.left_dock.hide()
             self.right_dock.hide()
             self.thumbs.hide()
+            self._use_full_resolution_preview()
             self.showFullScreen()
         else:
             self._is_fullscreen_mode = False
@@ -1698,6 +3164,7 @@ class MainWindow(QMainWindow):
             self.act_fullscreen.setChecked(False)
             self.act_fullscreen.blockSignals(False)
 
+            self._restore_preview_resolution()
             self.showNormal()
             if self._fs_prev_geometry is not None:
                 self.restoreGeometry(self._fs_prev_geometry)
@@ -1748,59 +3215,211 @@ class MainWindow(QMainWindow):
         self.saturation_value.setText(f"Saturation: {value}")
         self._current_params["saturation"] = value
         if self._preview_base_image is not None:
+            self._push_params_to_view()
             self._schedule_render()
 
     def _on_contrast_changed(self, value: int):
         self.contrast_value.setText(f"Contrast: {value}")
         self._current_params["contrast"] = value
         if self._preview_base_image is not None:
+            self._push_params_to_view()
             self._schedule_render()
 
     def _on_exposure_changed(self, value: int):
         self.exposure_value.setText(f"Exposure: {value}")
         self._current_params["exposure"] = value
         if self._preview_base_image is not None:
+            self._push_params_to_view()
             self._schedule_render()
 
     def _on_highlights_changed(self, value: int):
         self.highlights_value.setText(f"Highlights: {value}")
         self._current_params["highlights"] = value
         if self._preview_base_image is not None:
+            self._push_params_to_view()
             self._schedule_render()
 
     def _on_shadows_changed(self, value: int):
         self.shadows_value.setText(f"Shadows: {value}")
         self._current_params["shadows"] = value
         if self._preview_base_image is not None:
+            self._push_params_to_view()
             self._schedule_render()
 
     def _on_whites_changed(self, value: int):
         self.whites_value.setText(f"Whites: {value}")
         self._current_params["whites"] = value
         if self._preview_base_image is not None:
+            self._push_params_to_view()
             self._schedule_render()
 
     def _on_blacks_changed(self, value: int):
         self.blacks_value.setText(f"Blacks: {value}")
         self._current_params["blacks"] = value
         if self._preview_base_image is not None:
+            self._push_params_to_view()
             self._schedule_render()
 
     def _on_temperature_changed(self, value: int):
         self.temperature_value.setText(f"Temp: {value}")
         self._current_params["temperature"] = value
         if self._preview_base_image is not None:
+            self._push_params_to_view()
             self._schedule_render()
 
     def _on_tint_changed(self, value: int):
         self.tint_value.setText(f"Tint: {value}")
         self._current_params["tint"] = value
         if self._preview_base_image is not None:
+            self._push_params_to_view()
             self._schedule_render()
 
     def _on_vibrance_changed(self, value: int):
         self.vibrance_value.setText(f"Vibrance: {value}")
         self._current_params["vibrance"] = value
+        if self._preview_base_image is not None:
+            self._push_params_to_view()
+            self._schedule_render()
+
+    def _on_brightness_changed(self, value: int):
+        if hasattr(self, "brightness_value"):
+            self.brightness_value.setText(f"Brightness: {value}")
+        self._current_params["brightness"] = value
+        if self._preview_base_image is not None:
+            self._schedule_render()
+
+    def _on_posterize_levels_changed(self, value: int):
+        if hasattr(self, "posterize_value"):
+            self.posterize_value.setText(f"Levels: {value}")
+        self._current_params["posterize_levels"] = max(2, value)
+        if self._preview_base_image is not None:
+            self._schedule_render()
+
+    def _on_white_balance_picker(self):
+        QMessageBox.information(
+            self,
+            "White Balance Picker",
+            "Picker functionality will be implemented soon.",
+        )
+
+    def _on_hsl_hue_changed(self, value: int):
+        self._current_params["hsl_hue"] = value
+        if hasattr(self, "hsl_color_wheel"):
+            self.hsl_color_wheel.blockSignals(True)
+            self.hsl_color_wheel.set_hue(value)
+            self.hsl_color_wheel.blockSignals(False)
+        if self._preview_base_image is not None:
+            self._schedule_render()
+
+    def _on_hsl_saturation_changed(self, value: int):
+        self._current_params["hsl_saturation"] = value
+        if self._preview_base_image is not None:
+            self._schedule_render()
+
+    def _on_hsl_luminance_changed(self, value: int):
+        self._current_params["hsl_luminance"] = value
+        if self._preview_base_image is not None:
+            self._schedule_render()
+
+    def _on_recolor_hue_changed(self, value: int):
+        self._current_params["recolor_hue"] = value
+        if self._preview_base_image is not None:
+            self._schedule_render()
+
+    def _on_recolor_saturation_changed(self, value: int):
+        self._current_params["recolor_saturation"] = value
+        if self._preview_base_image is not None:
+            self._schedule_render()
+
+    def _on_recolor_lightness_changed(self, value: int):
+        self._current_params["recolor_lightness"] = value
+        if self._preview_base_image is not None:
+            self._schedule_render()
+
+    def _on_bw_slider_changed(self, key: str, value: int):
+        self._current_params[key] = value
+        if self._preview_base_image is not None:
+            self._schedule_render()
+
+    def _on_selective_cyan_changed(self, value: int):
+        self._current_params["selective_cyan"] = value
+        if self._preview_base_image is not None:
+            self._schedule_render()
+
+    def _on_selective_magenta_changed(self, value: int):
+        self._current_params["selective_magenta"] = value
+        if self._preview_base_image is not None:
+            self._schedule_render()
+
+    def _on_selective_yellow_changed(self, value: int):
+        self._current_params["selective_yellow"] = value
+        if self._preview_base_image is not None:
+            self._schedule_render()
+
+    def _on_selective_black_changed(self, value: int):
+        self._current_params["selective_black"] = value
+        if self._preview_base_image is not None:
+            self._schedule_render()
+
+    def _on_color_balance_cyan_changed(self, value: int):
+        self._current_params["color_balance_cyan_red"] = value
+        if self._preview_base_image is not None:
+            self._schedule_render()
+
+    def _on_color_balance_magenta_changed(self, value: int):
+        self._current_params["color_balance_magenta_green"] = value
+        if self._preview_base_image is not None:
+            self._schedule_render()
+
+    def _on_color_balance_yellow_changed(self, value: int):
+        self._current_params["color_balance_yellow_blue"] = value
+        if self._preview_base_image is not None:
+            self._schedule_render()
+
+    def _on_color_wheel_hue_changed(self, hue: float):
+        if hasattr(self, "hsl_hue_slider"):
+            self.hsl_hue_slider.blockSignals(True)
+            self.hsl_hue_slider.setValue(int(round(hue)))
+            self.hsl_hue_slider.blockSignals(False)
+            self._on_hsl_hue_changed(int(round(hue)))
+
+    def _on_geometry_rotation_changed(self, value: int):
+        self._current_params["geometry_rotation"] = value
+        if self._preview_base_image is not None:
+            self._schedule_render()
+
+    def _on_geometry_scale_changed(self, value: int):
+        self._current_params["geometry_scale"] = value
+        if self._preview_base_image is not None:
+            self._schedule_render()
+
+    def _on_fx_noise_changed(self, value: int):
+        self._current_params["fx_noise"] = value
+        if self._preview_base_image is not None:
+            self._schedule_render()
+
+    def _on_fx_density_changed(self, value: int):
+        self._current_params["fx_density"] = value
+        if self._preview_base_image is not None:
+            self._schedule_render()
+
+    def _update_fx_color_button(self):
+        color = QColor(self._current_params.get("fx_color", "#ff8a3b"))
+        self.fx_filter_button.setStyleSheet(
+            f"background-color: {color.name()}; color: #000; border: 1px solid #555;"
+        )
+
+    def _on_fx_color_clicked(self):
+        initial = QColor(self._current_params.get("fx_color", "#ff8a3b"))
+        color = QColorDialog.getColor(initial, self, "Choose Filter Color")
+        if color and color.isValid():
+            self._current_params["fx_color"] = color.name()
+            self._update_fx_color_button()
+            if self._preview_base_image is not None:
+                self._schedule_render()
+
+    def _on_gradient_editor_changed(self, stops):
+        self._gradient_map_stops = [(pos, color.name()) for pos, color in stops]
         if self._preview_base_image is not None:
             self._schedule_render()
 
@@ -1813,7 +3432,7 @@ class MainWindow(QMainWindow):
 
         self._update_history_for_current_image()
         self.export_lrc(autosave=True)
-        self._update_histogram()
+        self._update_histogram_from_view(force=True)
 
     # ---------- history tree logic ----------
 
@@ -1877,23 +3496,41 @@ class MainWindow(QMainWindow):
     # ---------- Image pipeline ----------
 
     def _ensure_image_cached(self, path: str):
-        if path in self._image_cache:
+        try:
+            stat_mtime = os.path.getmtime(path)
+        except OSError:
+            stat_mtime = None
+
+        cache = self._image_cache.get(path)
+        if cache and (stat_mtime is None or cache.get("mtime") == stat_mtime):
             return
 
-        img = _load_qimage_any(path)
-        if img is None:
+        preview = _load_qimage_any(
+            path,
+            max_long_edge=self._preview_long_edge,
+            raw_fast=True,
+        )
+        if preview is None:
             return
 
-        max_w, max_h = 1200, 800
-        preview = img.scaled(
-            max_w, max_h,
-            Qt.KeepAspectRatio,
-            Qt.SmoothTransformation
-        ).convertToFormat(QImage.Format_RGBA8888)
+        full_img = cache.get("full") if cache else None
+        self._image_cache[path] = {
+            "full": full_img,
+            "preview": preview,
+            "mtime": stat_mtime,
+        }
 
-        preview = img.convertToFormat(QImage.Format_RGBA8888)
-
-        self._image_cache[path] = {"full": img, "preview": preview}
+    def _ensure_full_image(self, path: str) -> QImage | None:
+        self._ensure_image_cached(path)
+        cache = self._image_cache.get(path)
+        if not cache:
+            return None
+        img = cache.get("full")
+        if img is None or img.isNull():
+            img = _load_qimage_any(path)
+            if img is not None:
+                cache["full"] = img
+        return cache.get("full")
 
 
 
@@ -1905,7 +3542,12 @@ class MainWindow(QMainWindow):
 
         self._current_path = path
         self._preview_base_image = cache["preview"]
-                # recompute base arrays for this image once
+        self.image_view.set_image(self._preview_base_image)
+        self._zoom_mode = "fit"
+        self._rescale_preview()
+        self._current_pixmap = QPixmap.fromImage(self._preview_base_image)
+        self.image_view.update_cpu_pixmap(self._current_pixmap)
+        # recompute base arrays for this image once
         self._prepare_base_arrays()
 
 
@@ -1974,25 +3616,16 @@ class MainWindow(QMainWindow):
                 "tint": get("tint"),
                 "vibrance": get("vibrance"),
             })
+            self._push_params_to_view()
                     # --- rendering caches / performance ---
             self._base_rgb = None          # float32 RGB of current base image
             self._base_lum = None          # float32 luminance
             self._L_norm = None            # L = lum / 255.0
             self._tone_masks = {}          # precomputed masks for hi/sh/wh/bl
 
-            self._render_timer = QTimer(self)
-            self._render_timer.setSingleShot(True)
-            self._render_timer.timeout.connect(self._render_current_params)
-
             self._update_metadata_for_current()
 
-        if not params:
-            self._current_pixmap = QPixmap.fromImage(self._preview_base_image)
-            self._rescale_preview()
-        else:
-            self._apply_edit_params_to_current_image(params)
-
-        self._update_histogram()
+        self._update_histogram_from_view(force=True)
 
     def _prepare_base_arrays(self):
         """Compute base RGB, luminance and tone masks once per base image."""
@@ -2091,6 +3724,11 @@ class MainWindow(QMainWindow):
             mid = 128.0
             rgb = (rgb - mid) * con_factor + mid
 
+        bright_val = params.get("brightness", 128)
+        if bright_val != 128:
+            offset = (bright_val - 128.0) / 128.0 * 64.0
+            rgb += offset
+
         # tone sliders – reuse precomputed masks
         def tone_strength(val, scale=0.5):
             return (val - 128.0) / 128.0 * scale
@@ -2125,55 +3763,112 @@ class MainWindow(QMainWindow):
             weight = (1.0 - sat_dist)[..., None]
             rgb = lum3 + (rgb - lum3) * (1.0 + vib_amount * weight)
 
+        hsv_cache = {"h": None, "s": None, "v": None}
+
+        def ensure_hsv():
+            if hsv_cache["h"] is None:
+                h, s, v = _rgb_to_hsv_np(rgb)
+                hsv_cache["h"], hsv_cache["s"], hsv_cache["v"] = h, s, v
+            return hsv_cache["h"], hsv_cache["s"], hsv_cache["v"]
+
+        hue_shift = params.get("hsl_hue", 0) + params.get("recolor_hue", 0)
+        sat_shift = params.get("hsl_saturation", 0) + params.get("recolor_saturation", 0)
+        lum_shift = params.get("hsl_luminance", 0) + params.get("recolor_lightness", 0)
+        if any(abs(x) > 1e-3 for x in (hue_shift, sat_shift, lum_shift)):
+            h, s, v = ensure_hsv()
+            if hue_shift:
+                h = (h + hue_shift / 360.0) % 1.0
+            if sat_shift:
+                s = np.clip(s * (1.0 + sat_shift / 100.0), 0.0, 1.0)
+            if lum_shift:
+                v = np.clip(v + lum_shift / 100.0, 0.0, 1.0)
+            rgb = _hsv_to_rgb_np(h, s, v)
+
+        bw_keys = ["bw_red", "bw_yellow", "bw_green", "bw_cyan", "bw_blue", "bw_magenta"]
+        if any(params.get(k, 0) != 0 for k in bw_keys):
+            h, _, _ = ensure_hsv()
+            hue_deg = (h * 360.0) % 360.0
+            weight = np.zeros_like(hue_deg)
+            color_ranges = [
+                (0, "bw_red"),
+                (60, "bw_yellow"),
+                (120, "bw_green"),
+                (180, "bw_cyan"),
+                (240, "bw_blue"),
+                (300, "bw_magenta"),
+            ]
+            for center, key in color_ranges:
+                slider = params.get(key, 0) / 100.0
+                if slider == 0:
+                    continue
+                diff = np.abs(((hue_deg - center + 180) % 360) - 180)
+                influence = np.clip(1.0 - diff / 40.0, 0.0, 1.0)
+                weight += slider * influence
+            grey = (
+                0.299 * rgb[..., 0] +
+                0.587 * rgb[..., 1] +
+                0.114 * rgb[..., 2]
+            )
+            grey = np.clip(grey * (1.0 + weight), 0.0, 255.0)
+            rgb = np.stack([grey, grey, grey], axis=-1)
+
+        gradient_stops = getattr(self, "_gradient_map_stops", None)
+        if gradient_stops and len(gradient_stops) >= 2:
+            sorted_stops = sorted(gradient_stops, key=lambda s: s[0])
+            positions = np.array([max(0.0, min(1.0, pos)) for pos, _ in sorted_stops], dtype=np.float32)
+            colors = np.array(
+                [[QColor(color).red(), QColor(color).green(), QColor(color).blue()] for _, color in sorted_stops],
+                dtype=np.float32,
+            )
+            L_norm = np.clip(self._L_norm, 0.0, 1.0).reshape(-1)
+            r = np.interp(L_norm, positions, colors[:, 0])
+            g = np.interp(L_norm, positions, colors[:, 1])
+            b = np.interp(L_norm, positions, colors[:, 2])
+            mapped = np.stack([r, g, b], axis=-1).reshape(rgb.shape)
+            rgb = mapped
+
+        posterize_levels = params.get("posterize_levels", 0)
+        if posterize_levels and posterize_levels > 1:
+            bins = max(2, int(posterize_levels))
+            step = 255.0 / (bins - 1)
+            rgb = np.round(rgb / step) * step
+
         # write back to QImage buffer
         rgb_u8 = np.clip(rgb, 0, 255).astype(np.uint8)
         arr[:, :w, :3] = rgb_u8
 
         # keep alpha as-is
         self._current_pixmap = QPixmap.fromImage(img)
-        self._rescale_preview()
-        self._update_histogram()
+        self.image_view.update_cpu_pixmap(self._current_pixmap)
 
 
     def _schedule_render(self):
         """Debounce rendering so rapid slider moves don't re-render every tick."""
-        # 40–60 ms feels responsive but avoids spamming the CPU
-        self._render_timer.start(50)
+        if not self.image_view.has_image():
+            return
+        # 40–60 ms feels responsive but avoids spamming grabFramebuffer
+        self._render_timer.start(60)
 
     def _render_current_params(self):
-        if self._preview_base_image is not None:
-            self._apply_edit_params_to_current_image(self._current_params)
+        if self._preview_base_image is None:
+            return
+        self._apply_edit_params_to_current_image(self._current_params)
+        self._update_histogram_from_view()
+
+    def _push_params_to_view(self):
+        if self._preview_base_image is None:
+            return
+        self.image_view.set_params(self._current_params)
 
 
     def _rescale_preview(self):
-        if self._current_pixmap is None:
+        if not self.image_view.has_image():
             return
 
         if self._zoom_mode == "fit":
-            # Fit to scrollarea viewport
-            vp_size = self.image_scroll.viewport().size()
-            if vp_size.width() <= 0 or vp_size.height() <= 0:
-                return
-            scaled = self._current_pixmap.scaled(
-                vp_size,
-                Qt.KeepAspectRatio,
-                Qt.SmoothTransformation,
-            )
+            self._zoom_factor = self.image_view.fit_to_window()
         else:
-            # Manual zoom factor
-            w = int(self._current_pixmap.width() * self._zoom_factor)
-            h = int(self._current_pixmap.height() * self._zoom_factor)
-            w = max(1, w)
-            h = max(1, h)
-            scaled = self._current_pixmap.scaled(
-                w, h,
-                Qt.KeepAspectRatio,
-                Qt.SmoothTransformation,
-            )
-
-        self.image_display.setPixmap(scaled)
-        self.image_display.resize(scaled.size())
-        self.image_display.setText("")
+            self._zoom_factor = self.image_view.set_manual_zoom(self._zoom_factor)
         self._update_zoom_label()
 
 
@@ -2199,7 +3894,18 @@ class MainWindow(QMainWindow):
         task.signals.ready.connect(self._on_thumb_ready)
         self.pool.start(task)
 
-    def _on_thumb_ready(self, path: str, icon: QIcon):
+    def _on_thumb_ready(self, path: str, image: QImage):
+        if image.isNull():
+            icon = QIcon()
+        else:
+            pm = QPixmap.fromImage(image)
+            pm = pm.scaled(
+                self.thumbs.iconSize(),
+                Qt.KeepAspectRatio,
+                Qt.SmoothTransformation,
+            )
+            icon = QIcon(pm)
+
         self._icon_cache[path] = icon
         self._loading.discard(path)
         item = self._item_for_path.get(path)
@@ -2241,6 +3947,7 @@ class MainWindow(QMainWindow):
         self._current_path = None
         self._preview_base_image = None
         self._current_pixmap = None
+        self.image_view.clear_image()
 
         count = 0
         for name in sorted(os.listdir(folder_path)):
@@ -2267,39 +3974,9 @@ class MainWindow(QMainWindow):
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        if self._current_pixmap is not None and self._zoom_mode == "fit":
+        if self.image_view.has_image() and self._zoom_mode == "fit":
             self._rescale_preview()
         self._ensure_visible_thumbs()
-
-
-        # ---------- event filter: drag to pan image ----------
-
-    def eventFilter(self, obj, event):
-        if obj is self.image_display:
-            if event.type() == QEvent.MouseButtonPress and event.button() == Qt.LeftButton:
-                if self.image_display.pixmap() and not self.image_display.pixmap().isNull():
-                    self._dragging = True
-                    self._drag_last_pos = event.pos()
-                    self.image_display.setCursor(Qt.ClosedHandCursor)
-                    return True
-
-            elif event.type() == QEvent.MouseMove and self._dragging:
-                delta = event.pos() - self._drag_last_pos
-                self._drag_last_pos = event.pos()
-                hbar = self.image_scroll.horizontalScrollBar()
-                vbar = self.image_scroll.verticalScrollBar()
-                hbar.setValue(hbar.value() - delta.x())
-                vbar.setValue(vbar.value() - delta.y())
-                return True
-
-            elif event.type() == QEvent.MouseButtonRelease and event.button() == Qt.LeftButton:
-                self._dragging = False
-                self.image_display.setCursor(Qt.ArrowCursor)
-                return True
-
-        return super().eventFilter(obj, event)
-
-
 
     # ---------- Export / import (.lrc) ----------
 
@@ -2336,6 +4013,7 @@ class MainWindow(QMainWindow):
                 self._apply_edit_params_to_current_image(params)
             else:
                 self._current_pixmap = QPixmap.fromImage(self._preview_base_image)
+                self.image_view.update_cpu_pixmap(self._current_pixmap)
 
             self._update_history_for_current_image()
 
@@ -2515,3 +4193,4 @@ if __name__ == "__main__":
                 print("Failed to auto-load project:", e)
 
     sys.exit(app.exec())
+
