@@ -1,7 +1,10 @@
+import base64
+import copy
 import os
 import sys
 import json
 from datetime import datetime
+from io import BytesIO
 
 import numpy as np
 
@@ -46,13 +49,29 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QTabBar,
     QColorDialog,
+    QMenuBar,
 )
 from PySide6.QtCore import Qt, QSize, QPoint, QTimer, QDir, QEvent, QThreadPool
 from PySide6.QtGui import QPixmap, QIcon, QImageReader, QFontMetrics, QImage, QPainter, QColor, QPen, QPolygon
 from PIL import Image, ExifTags
 
 from .adjustments_panel import AdjustmentsPanel
-from .constants import IMAGE_EXTENSIONS, LRC_VERSION
+from .constants import (
+    IMAGE_EXTENSIONS,
+    LRC_VERSION,
+    PROJECT_EXTENSION,
+    LEGACY_PROJECT_EXTENSION,
+)
+from .color_tools import (
+    apply_black_white,
+    apply_color_balance,
+    apply_color_white_balance,
+    apply_hsl,
+    apply_recolor,
+    apply_selective_color,
+    default_color_params,
+    merge_color_params,
+)
 from .utils import (
     abspath_from_base as _abspath_from_base,
     relpath_or_same as _relpath_or_same,
@@ -60,12 +79,108 @@ from .utils import (
 )
 from .widgets import HistogramWidget, ThumbnailFileSystemModel, _ThumbTask
 
+
+def _resource_path(*parts: str) -> str:
+    """Resolve asset paths inside development sources or a PyInstaller bundle."""
+    bundle_root = getattr(sys, "_MEIPASS", None)
+    if bundle_root is None:
+        bundle_root = os.path.normpath(os.path.join(os.path.dirname(__file__), ".."))
+    return os.path.normpath(os.path.join(bundle_root, *parts))
+
+
+class TitleBar(QWidget):
+    """Custom top bar with logo, title, menubar, and window buttons."""
+
+    def __init__(self, parent=None, icon_pix: QPixmap | None = None, menu_bar: QMenuBar | None = None):
+        super().__init__(parent)
+        self._mouse_pos = None
+        self._menu_bar = menu_bar
+
+        self.setObjectName("TitleBar")
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(8, 0, 8, 0)
+        layout.setSpacing(10)
+
+        self.icon_label = QLabel(self)
+        self.icon_label.setFixedSize(20, 20)
+        self.icon_label.setScaledContents(True)
+        if icon_pix and not icon_pix.isNull():
+            self.icon_label.setPixmap(icon_pix.scaled(20, 20, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+
+        self.title_label = QLabel("Gradience Studio", self)
+        self.title_label.setObjectName("TitleBarTitle")
+        self.title_label.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Preferred)
+
+        layout.addWidget(self.icon_label)
+        layout.addWidget(self.title_label)
+
+        if self._menu_bar is not None:
+            self._menu_bar.setParent(self)
+            self._menu_bar.setNativeMenuBar(False)
+            layout.addWidget(self._menu_bar, 1)
+
+        layout.addStretch(1)
+
+        self.min_button = QPushButton("–", self)
+        self.max_button = QPushButton("□", self)
+        self.close_button = QPushButton("✕", self)
+
+        for btn in (self.min_button, self.max_button, self.close_button):
+            btn.setObjectName("TitleBarButton")
+            btn.setFixedSize(30, 22)
+
+        layout.addWidget(self.min_button)
+        layout.addWidget(self.max_button)
+        layout.addWidget(self.close_button)
+
+        self.min_button.clicked.connect(self._on_minimize)
+        self.max_button.clicked.connect(self._on_maximize_restore)
+        self.close_button.clicked.connect(self._on_close)
+
+    # Drag/move support
+    def mousePressEvent(self, event):  # noqa: N802
+        if event.button() == Qt.LeftButton:
+            self._mouse_pos = event.globalPosition().toPoint()
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):  # noqa: N802
+        if self._mouse_pos is not None and event.buttons() & Qt.LeftButton:
+            delta = event.globalPosition().toPoint() - self._mouse_pos
+            window = self.window()
+            window.move(window.pos() + delta)
+            self._mouse_pos = event.globalPosition().toPoint()
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):  # noqa: N802
+        self._mouse_pos = None
+        super().mouseReleaseEvent(event)
+
+    def mouseDoubleClickEvent(self, event):  # noqa: N802
+        if event.button() == Qt.LeftButton:
+            self._on_maximize_restore()
+        super().mouseDoubleClickEvent(event)
+
+    def _on_minimize(self):
+        self.window().showMinimized()
+
+    def _on_maximize_restore(self):
+        w = self.window()
+        if w.isMaximized():
+            w.showNormal()
+        else:
+            w.showMaximized()
+
+    def _on_close(self):
+        self.window().close()
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
 
         # ---------- Window basics ----------
-        self.setWindowTitle("LightRoom Clone")
+        self.setWindowTitle("Gradience Studio")
         self.setWindowIcon(QIcon("icon.ico"))
         self.resize(1200, 800)
         self.setMinimumSize(600, 400)
@@ -76,6 +191,22 @@ class MainWindow(QMainWindow):
         self.vbox.setContentsMargins(8, 8, 8, 8)
         self.vbox.setSpacing(8)
 
+        icon_pix = QPixmap("icon.ico")
+        self.menu_bar = QMenuBar(self)
+        self.menu_bar.setNativeMenuBar(False)
+        self.menu_bar.setObjectName("MainMenuBar")
+
+        self.header_filename_label = QLabel("No file loaded")
+        self.header_filename_label.setObjectName("headerFilename")
+        self.header_filename_label.setAlignment(Qt.AlignCenter)
+
+        # Body layout (existing UI)
+        self.body_container = QWidget()
+        self.body_layout = QVBoxLayout(self.body_container)
+        self.body_layout.setContentsMargins(8, 8, 8, 8)
+        self.body_layout.setSpacing(8)
+
+
         # ---------- State ----------
         self._current_folder: str | None = None
         self._current_path: str | None = None
@@ -85,11 +216,20 @@ class MainWindow(QMainWindow):
         self._image_cache: dict[str, dict] = {}   # path -> {"full": QImage, "preview": QImage}
         self._image_params: dict[str, dict] = {}  # path -> params
         self._image_parents: dict[str, QTreeWidgetItem] = {}
-        self._edits: dict[str, dict] = {}         # for .lrc export
+        self._edits: dict[str, dict] = {}         # for project export
         self._metadata_labels: dict[str, QLabel] = {}
 
         self._project_path: str | None = None
         self._project_root: str | None = None
+
+        # fullscreen state defaults
+        self._is_fullscreen_mode = False
+        self._fs_prev_geometry = None
+        self._fs_prev_menubar_visible = True
+        self._fs_prev_statusbar_visible = True
+        self._fs_prev_left_visible = True
+        self._fs_prev_right_visible = True
+        self._fs_prev_filmstrip_visible = True
 
         # preview scale used by thumbnail/render pipeline; set early to avoid attribute errors
         self._preview_scale = 1.0
@@ -100,6 +240,7 @@ class MainWindow(QMainWindow):
         self._drag_last_pos = QPoint()
 
         # current parameters (Light + Color tabs)
+        self._color_defaults = default_color_params()
         self._current_params = {
             "exposure": 128,
             "contrast": 128,
@@ -121,7 +262,14 @@ class MainWindow(QMainWindow):
             "levels_channel": "Master",
             "levels_linear": False,
         }
-        self._default_params_template = dict(self._current_params)
+        for _color in ["red", "orange", "yellow", "green", "aqua", "blue", "purple", "magenta"]:
+            self._current_params.update({
+                f"hsl_hue_{_color}": 0,
+                f"hsl_sat_{_color}": 0,
+                f"hsl_lum_{_color}": 0,
+            })
+        self._current_params["color"] = copy.deepcopy(self._color_defaults)
+        self._default_params_template = copy.deepcopy(self._current_params)
         self._active_edit: dict = {"effects": []}
         self._active_edits_by_path: dict[str, dict] = {}
 
@@ -141,24 +289,25 @@ class MainWindow(QMainWindow):
 
         # ---------- Central image area ----------
                 # ---------- Central image area + zoom toolbar ----------
-        self.image_display = QLabel("No Image Loaded")
+        self.image_display = QLabel("No folder open. File → Import Folder")
         self.image_display.setAlignment(Qt.AlignCenter)
         self.image_display.setMinimumSize(200, 200)
         self.image_display.setObjectName("imageDisplay")
 
         # Scroll area to allow panning
         self.image_scroll = QScrollArea()
+        self.image_scroll.setObjectName("imageScroll")
         self.image_scroll.setFrameShape(QFrame.NoFrame)
         self.image_scroll.setWidgetResizable(False)
         self.image_scroll.setWidget(self.image_display)
         self.image_scroll.setAlignment(Qt.AlignCenter)
 
-        # DxO-style zoom toolbar
+        # Preview/zoom toolbar
         self.image_toolbar = QWidget()
         self.image_toolbar.setObjectName("imageToolBar")
         tb = QHBoxLayout(self.image_toolbar)
-        tb.setContentsMargins(0, 0, 0, 0)
-        tb.setSpacing(6)
+        tb.setContentsMargins(8, 4, 8, 4)
+        tb.setSpacing(8)
 
         self.zoom_fit_btn = QPushButton("Fit")
         self.zoom_100_btn = QPushButton("100%")
@@ -177,19 +326,22 @@ class MainWindow(QMainWindow):
         self.preview_res_combo.addItem("Preview: 1/4", 0.25)
         self.preview_res_combo.addItem("Preview: 1/8", 0.125)
 
-        tb.addStretch(1)
         tb.addWidget(self.preview_res_combo)
-        tb.addSpacing(12)
+        tb.addSpacing(6)
         tb.addWidget(self.zoom_fit_btn)
         tb.addWidget(self.zoom_100_btn)
-        tb.addSpacing(12)
         tb.addWidget(self.zoom_out_btn)
         tb.addWidget(self.zoom_label)
         tb.addWidget(self.zoom_in_btn)
         tb.addStretch(1)
 
-        self.vbox.addWidget(self.image_toolbar, 0)
-        self.vbox.addWidget(self.image_scroll, 1)
+        filename_row = QHBoxLayout()
+        filename_row.setContentsMargins(12, 6, 12, 6)
+        filename_row.addWidget(self.header_filename_label, 0, Qt.AlignCenter)
+
+        self.body_layout.addWidget(self.image_toolbar, 0)
+        self.body_layout.addWidget(self.image_scroll, 1)
+        self.body_layout.addLayout(filename_row, 0)
 
         # zoom button signals
         self.zoom_fit_btn.clicked.connect(self._on_zoom_fit)
@@ -230,7 +382,7 @@ class MainWindow(QMainWindow):
         self.thumbs.setMinimumHeight(cell_h * 2)
         self.thumbs.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
 
-        self.vbox.addWidget(self.thumbs, 0)
+        self.body_layout.addWidget(self.thumbs, 0)
 
         # thumbnail selection
         self.thumbs.itemClicked.connect(self._on_thumbnail_clicked)
@@ -257,6 +409,7 @@ class MainWindow(QMainWindow):
 
         # ---------- Right dock: adjustments & metadata ----------
         self.hist_widget = HistogramWidget(self)
+        self.hist_widget.setObjectName("histogramPanel")
 
         self.right_dock = QDockWidget("Adjustments", self)
         self.right_dock.setObjectName("rightSidebar")
@@ -285,7 +438,7 @@ class MainWindow(QMainWindow):
 
 
         # ---------- Left dock: active edit + folders ----------
-        self.left_dock = QDockWidget("Panels", self)
+        self.left_dock = QDockWidget("Library", self)
         self.left_dock.setObjectName("leftSidebar")
         self.left_dock.setAllowedAreas(Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea)
         self.left_dock.setFeatures(
@@ -302,6 +455,8 @@ class MainWindow(QMainWindow):
         self._build_active_edit_tab()
         self._build_folders_tab()
 
+        # Use the native dock title bar (blank) to retain movability
+        self.left_dock.setWindowTitle("")
         self.left_dock.setWidget(self.left_tabs)
         self.left_dock.setMinimumWidth(260)
 
@@ -329,6 +484,11 @@ class MainWindow(QMainWindow):
 
         # ---------- Window menu: layout & visibility ----------
         self._build_window_menu()
+        # Apply theme once UI is built
+        self._apply_styles()
+
+        # Final assembly: body container only (native title bar)
+        self.vbox.addWidget(self.body_container, 1)
 
     def show_histogram_dock(self):
         """Toggle the histogram dock visibility without altering layout."""
@@ -364,6 +524,10 @@ class MainWindow(QMainWindow):
             self.adjust_panel.light_group.reset_ui_to_defaults()
         except Exception:
             pass
+        try:
+            self.adjust_panel.color_group.reset_ui_to_defaults()
+        except Exception:
+            pass
 
         # Save default layout for restore
         self._default_layout_state = self.saveState()
@@ -378,6 +542,18 @@ class MainWindow(QMainWindow):
         self._base_lum = None
         self._L_norm = None
         self._tone_masks = {}
+
+    def _update_header_filename(self, path: str | None):
+        """Update header filename label without altering core logic."""
+        if not hasattr(self, "header_filename_label"):
+            return
+        text = "No file loaded"
+        if path:
+            try:
+                text = os.path.basename(path)
+            except Exception:
+                text = path
+        self.header_filename_label.setText(text)
 
         # ---------- zoom helpers ----------
 
@@ -580,11 +756,18 @@ class MainWindow(QMainWindow):
         Rebuilds the preview for the current image and re-applies edits.
         """
         ui_state = None
-        if hasattr(self, "adjust_panel") and hasattr(self.adjust_panel, "light_group"):
+        color_state = None
+        if hasattr(self, "adjust_panel"):
             try:
-                ui_state = self.adjust_panel.light_group.capture_ui_state()
+                if hasattr(self.adjust_panel, "light_group"):
+                    ui_state = self.adjust_panel.light_group.capture_ui_state()
             except Exception:
                 ui_state = None
+            try:
+                if hasattr(self.adjust_panel, "color_group"):
+                    color_state = self.adjust_panel.color_group.capture_ui_state()
+            except Exception:
+                color_state = None
 
         data = self.preview_res_combo.currentData()
         if data is None:
@@ -621,11 +804,17 @@ class MainWindow(QMainWindow):
         self._apply_edit_params_to_current_image(self._current_params)
 
         # Restore slider positions to whatever the user set
-        if ui_state and hasattr(self, "adjust_panel") and hasattr(self.adjust_panel, "light_group"):
-            try:
-                self.adjust_panel.light_group.restore_ui_state(ui_state)
-            except Exception:
-                pass
+        if hasattr(self, "adjust_panel"):
+            if ui_state and hasattr(self.adjust_panel, "light_group"):
+                try:
+                    self.adjust_panel.light_group.restore_ui_state(ui_state)
+                except Exception:
+                    pass
+            if color_state and hasattr(self.adjust_panel, "color_group"):
+                try:
+                    self.adjust_panel.color_group.restore_ui_state(color_state)
+                except Exception:
+                    pass
 
 
 
@@ -648,8 +837,8 @@ class MainWindow(QMainWindow):
 
 
     def _build_menus(self):
-        # Lightroom Clone (app) menu
-        app_menu = self.menuBar().addMenu("&Lightroom Clone")
+        # Gradience Studio (app) menu
+        app_menu = self.menuBar().addMenu("&Gradience Studio")
 
         self.act_preferences = app_menu.addAction("&Preferences...")
         self.act_preferences.setShortcut("Ctrl+,")
@@ -675,6 +864,7 @@ class MainWindow(QMainWindow):
         self.act_save_project = file_menu.addAction("&Save Project")
         self.act_save_project.setShortcut("Ctrl+S")
         self.act_save_project.triggered.connect(self.export_lrc)
+
         
 
     # ---- left dock ---- #
@@ -725,6 +915,9 @@ class MainWindow(QMainWindow):
     # ---- window menu ---- #
 
     def _build_window_menu(self):
+        # Edit menu (placeholder to keep menus visible and aligned)
+        edit_menu = self.menuBar().addMenu("&Edit")
+
         window_menu = self.menuBar().addMenu("&Window")
 
         self.act_restore_layout = window_menu.addAction("Restore Window Layout")
@@ -754,357 +947,550 @@ class MainWindow(QMainWindow):
     # ------------- styling ------------- #
 
     def _apply_styles(self):
-        accent = "#00b4ff"
+        # Affinity-style neutral dark palette
+        ui_window_bg = "#1E1E1E"
+        ui_panel_bg = "#2A2A2A"
+        ui_deep_bg = "#252525"
+        ui_toolbar_bg = "#2F2F2F"
+        ui_canvas_bg = "#252525"
+        ui_tray_bg = "#252525"
+        ui_control_bg = "#2D2D2D"
+        ui_border = "#3A3A3A"
+        ui_divider = "#3C3C3C"
+        ui_outline = "#3F3F3F"
+
+        text_primary = "#E5E5E5"
+        text_secondary = "#B8B8B8"
+        text_disabled = "#666666"
+
+        hover_bg = "#3C3C3C"
+        pressed_bg = "#454545"
+        focus_ring = "#4A4A4A"
+
+        slider_handle = "#D0D0D0"
+        slider_filled = "#7A7A7A"
+        slider_empty = "#3C3C3C"
+        # Brand gradient for slider fill only
+        gs_blue = "#1E6DFF"
+        gs_indigo = "#5B3CFF"
+        gs_purple = "#7C2CFF"
+        gs_magenta = "#C12AFF"
+        gs_orange = "#FF7A2F"
+        grad = f"stop:0 {gs_blue}, stop:0.25 {gs_indigo}, stop:0.5 {gs_purple}, stop:0.75 {gs_magenta}, stop:1 {gs_orange}"
+        check_icon_css = ""
+        icon_path = _resource_path("icons", "check.png")
+        if os.path.exists(icon_path):
+            try:
+                with Image.open(icon_path) as icon_img:
+                    icon_img = icon_img.convert("RGBA")
+                    icon_img.thumbnail((16, 16), Image.LANCZOS)
+                    buf = BytesIO()
+                    icon_img.save(buf, format="PNG")
+                    encoded = base64.b64encode(buf.getvalue()).decode("ascii")
+                check_icon_css = (
+                    f'image: url("data:image/png;base64,{encoded}");'
+                    "\n            image-position: center;"
+                )
+            except Exception:
+                check_icon_css = ""
 
         self.setStyleSheet(f"""
         QMainWindow {{
-            background-color: #1c1d1f;
-            color: #f0f0f0;
+            background-color: {ui_window_bg};
+            color: {text_primary};
+        }}
+        QWidget#TitleBar {{
+            background-color: #202020;
+            border-bottom: 1px solid #2A2A2A;
+            min-height: 0px;
         }}
         * {{
-            font-family: "Segoe UI", "Roboto", sans-serif;
-            font-size: 9pt;
+            font-family: "Segoe UI", "Inter", sans-serif;
+            font-size: 12px;
+            color: {text_primary};
+        }}
+        *:disabled {{
+            color: {text_disabled};
+            font-weight: 400;
         }}
         QLabel {{
-            color: #f0f0f0;
+            background: transparent;
+            font-weight: 400;
+            font-size: 12px;
+        }}
+
+        /* Menu */
+        QMenuBar#MainMenuBar {{
+            background-color: transparent;
+            color: {text_primary};
+            padding: 0 8px;
+            height: 32px;
+        }}
+        QMenuBar#MainMenuBar::item {{
+            padding: 6px 12px;
+            margin: 0 6px;
             background: transparent;
         }}
-
-        QMenuBar {{
-            background-color: #2b2c2f;
-            color: #f5f5f5;
-            padding: 0 6px;
-            border-bottom: 1px solid #17181a;
-        }}
-        QMenuBar::item {{
-            padding: 4px 10px;
-            background: transparent;
-        }}
-        QMenuBar::item:selected {{
-            background-color: #3a3b3f;
-            border-radius: 2px;
-        }}
-
-        QMenu {{
-            background-color: #2b2c2f;
-            border: 1px solid #3c3d42;
-            padding: 4px 0;
-        }}
-        QMenu::item {{
-            padding: 4px 20px;
-            color: #e6e6e8;
-        }}
-        QMenu::item:selected {{
-            background-color: #3a3b41;
-            color: {accent};
-        }}
-
-        QWidget#adjustHeader {{
-            background-color: #303236;
-            border-bottom: 1px solid #151618;
-        }}
-
-        QWidget#adjustIconBar {{
-            background-color: #26272b;
-            border-bottom: 1px solid #303236;
-        }}
-
-        QWidget#adjustFooter {{
-            background-color: #26272b;
-            border-top: 1px solid #303236;
-        }}
-
-        QWidget#adjustIconBar QToolButton {{
-            border: none;
-            padding: 4px;
-            margin: 0 2px;
-        }}
-
-        QWidget#adjustIconBar QToolButton:checked {{
-            background-color: #2f8fff;
+        QMenuBar#MainMenuBar::item:selected {{
+            background-color: #2A2A2A;
             border-radius: 4px;
+            color: {text_primary};
+        }}
+        QLabel#TitleBarTitle {{
+            font-size: 14px;
+            font-weight: 600;
+            color: {text_primary};
+            padding-left: 0px;
+        }}
+        QMenuBar#MainMenuBar {{
+            background-color: transparent;
+            color: {text_primary};
+        }}
+        QMenuBar#MainMenuBar::item {{
+            padding: 4px 10px;
+            margin: 0 2px;
+            background: transparent;
+        }}
+        QMenuBar#MainMenuBar::item:selected {{
+            background-color: #2A2A2A;
+            border-radius: 4px;
+            color: {text_primary};
+        }}
+        QMenu {{
+            background-color: {ui_panel_bg};
+            border: 1px solid {ui_border};
+            padding: 6px 0;
+        }}
+        QMenu::item {{ padding: 6px 18px; color: {text_primary}; }}
+        QMenu::item:selected {{ background-color: {ui_control_bg}; }}
+
+        /* Header */
+        QWidget#headerBar {{
+            background-color: {ui_panel_bg};
+            border: 1px solid {ui_border};
+            border-radius: 6px;
+        }}
+        QLabel#headerTitle {{
+            font-size: 20px;
+            font-weight: 700;
+        }}
+        QLabel#headerFilename {{
+            color: {text_secondary};
+            font-weight: 400;
+            font-size: 12px;
+        }}
+        QToolButton#headerBtn {{
+            background-color: {ui_control_bg};
+            border: 1px solid {ui_border};
+            border-radius: 5px;
+            padding: 6px 10px;
+        }}
+        QToolButton#headerBtn:hover {{
+            border-color: {focus_ring};
+            background-color: {ui_control_bg};
+        }}
+        QToolButton#headerBtn:pressed {{ background-color: #252525; }}
+        QToolButton#headerBtn:disabled {{ color: {text_disabled}; }}
+
+        /* Image toolbar */
+        QWidget#imageToolBar {{
+            background-color: {ui_panel_bg};
+            border: 1px solid {ui_border};
+            border-radius: 6px;
+        }}
+        QWidget#imageToolBar QPushButton {{
+            background-color: {ui_control_bg};
+            border: 1px solid {ui_outline};
+            border-radius: 4px;
+            padding: 4px 10px;
+            font-weight: 500;
+            font-size: 13px;
+            color: #E4E4E4;
+        }}
+        QWidget#imageToolBar QPushButton:hover {{ background-color: {hover_bg}; }}
+        QWidget#imageToolBar QPushButton:pressed {{ background-color: {pressed_bg}; }}
+        QWidget#imageToolBar QLabel {{ color: {text_primary}; }}
+
+        QComboBox {{
+            background-color: {ui_control_bg};
+            border: 1px solid {ui_divider};
+            padding: 4px 8px;
+            border-radius: 4px;
+            color: {text_primary};
+        }}
+        QComboBox::drop-down {{ border: none; width: 18px; }}
+        QComboBox QAbstractItemView {{
+            background-color: {ui_control_bg};
+            selection-background-color: {ui_panel_bg};
+            selection-color: {text_primary};
+            border: 1px solid {ui_border};
         }}
 
-
-        QStatusBar {{
-            background-color: #222326;
-            color: #b4b6ba;
-            border-top: 1px solid #17181a;
+        /* Filmstrip */
+        QListWidget#bottomFilmstrip {{
+            background-color: {ui_tray_bg};
+            border-top: 1px solid {ui_border};
+        }}
+        QListWidget#bottomFilmstrip::item {{
+            border: 1px solid transparent;
+            padding: 6px 4px 2px 4px;
+            margin: 2px;
+            color: {text_secondary};
+        }}
+        QListWidget#bottomFilmstrip::item:selected {{
+            border: 2px solid {ui_border};
+            background: qlineargradient(x1:0, y1:0, x2:1, y2:0, {grad});
+            color: {text_primary};
+        }}
+        QListWidget#bottomFilmstrip::item:hover:!selected {{
+            border: 1px solid {ui_border};
+            background-color: {hover_bg};
         }}
 
-        #imageDisplay {{
-            background-color: #141516;
-            border: 1px solid #303236;
-            color: #c3c5c8;
-        }}
-
+        /* Docks */
         QDockWidget {{
-            background-color: #242528;
-            border: 1px solid #303236;
+            background-color: {ui_panel_bg};
+            border: 1px solid {ui_border};
         }}
         QDockWidget::title {{
-            padding: 4px 10px;
-            background-color: #303236;
-            color: #f4f4f5;
-            border-bottom: 1px solid #101114;
+            padding: 6px 10px;
+            background-color: {ui_panel_bg};
+            color: {text_primary};
         }}
-        QDockWidget#leftSidebar {{
-            border-right: 1px solid #151618;
+        QDockWidget#leftSidebar {{ border-right: 1px solid {ui_border}; }}
+        QDockWidget#rightSidebar {{ border-left: 1px solid {ui_border}; }}
+        QDockWidget#rightSidebar QWidget, QDockWidget#histSidebar QWidget {{
+            background-color: {ui_panel_bg};
         }}
-        QDockWidget#rightSidebar {{
-            border-left: 1px solid #151618;
+        QDockWidget#leftSidebar QWidget {{
+            background-color: {ui_tray_bg};
+        }}
+        QWidget#adjustGradientStrip {{
+            height: 4px;
+            border-radius: 2px;
+            margin: 4px 12px;
+            background: qlineargradient(x1:0, y1:0, x2:1, y2:0, {grad});
         }}
 
+        /* Left tabs */
+        QTabWidget#leftTabs::pane {{ border: none; }}
+        QTabWidget#leftTabs QTabBar::tab {{
+            padding: 6px 10px;
+            color: {text_secondary};
+            background: transparent;
+            border: none;
+            margin-right: 4px;
+        }}
+        QTabWidget#leftTabs QTabBar::tab:selected {{
+            color: {text_primary};
+            border-bottom: 2px solid transparent;
+            border-image: linear-gradient(90deg, {grad}) 1;
+        }}
+        /* Left tab content + trees */
         QWidget#glassPanelLeft {{
-            background-color: #242528;
-            border: none;
+            background-color: {ui_tray_bg};
+            border: 1px solid {ui_border};
+            border-radius: 6px;
         }}
-
-        QTreeWidget#editHistoryTree {{
-            background-color: #242528;
-            border: none;
+        QTreeWidget#editHistoryTree, QTreeView#folderTree {{
+            background-color: {ui_tray_bg};
+            border: 1px solid {ui_border};
             padding: 4px 2px;
         }}
-        QTreeWidget#editHistoryTree::item {{
+        QTreeWidget#editHistoryTree::item, QTreeView#folderTree::item {{
             padding: 2px 4px;
             margin: 1px 0;
         }}
-        QTreeWidget#editHistoryTree::item:selected {{
-            background-color: rgba(0, 180, 255, 40);
-            border: 1px solid {accent};
+        QTreeWidget#editHistoryTree::item:selected, QTreeView#folderTree::item:selected {{
+            background-color: #181818;
+            border: 1px solid {ui_border};
             border-radius: 2px;
         }}
-        QTreeWidget#editHistoryTree::item:hover:!selected {{
-            background-color: #33353a;
-            border-radius: 2px;
-        }}
-
-        #histogramPanel {{
-            background-color: #18191c;
-            border: 1px solid #3a3c42;
-            border-radius: 2px;
-            min-height: 80px;
+        QTreeWidget#editHistoryTree::item:hover:!selected, QTreeView#folderTree::item:hover:!selected {{
+            background-color: #181818;
         }}
 
-        QWidget#adjustmentsContainer {{
-            background-color: #242528;
+        /* Histogram panel */
+        QWidget#histSidebar {{
+            background-color: {ui_panel_bg};
+            border: 1px solid {ui_border};
+        }}
+        QWidget#histSidebar QWidget {{
+            background-color: {ui_panel_bg};
+        }}
+        HistogramWidget, QWidget#histogramPanel, HistogramWidget#histogramPanel {{
+            background-color: {ui_tray_bg};
+            border: 1px solid {ui_border};
+            border-radius: 4px;
+            min-height: 120px;
+        }}
+
+        /* Adjustments area */
+        QWidget#adjustmentsRoot,
+        QWidget#adjustStack,
+        QWidget#adjustDetailContainer,
+        QWidget#adjustScrollContainer {{
+            background-color: {ui_panel_bg};
+        }}
+        QScrollArea#adjustScroll {{
+            background: {ui_panel_bg};
+            border: none;
+        }}
+        QScrollArea#adjustScroll QWidget {{
+            background: {ui_panel_bg};
         }}
         QPushButton#sectionHeaderButton {{
-            text-align: left;
-            padding: 4px 10px;
-            border: none;
-            background-color: #303236;
-            color: #f0f0f0;
-            font-weight: 500;
+            background-color: {ui_panel_bg};
+            border: 1px solid {ui_border};
+            border-radius: 2px;
+            padding: 6px 8px;
+            font-weight: 600;
+            font-size: 12px;
         }}
-        QPushButton#sectionHeaderButton:hover {{
-            background-color: #3a3c40;
+        QPushButton#sectionHeaderButton:checked {{
+            background-color: {ui_control_bg};
         }}
         QWidget#sectionContent {{
-            background-color: #26272b;
-            border-bottom: 1px solid #303236;
+            background-color: {ui_panel_bg};
+            border: 1px solid {ui_border};
+            border-top: none;
         }}
 
-        /* Right dock icon tabs */
-        QTabWidget#rightTabs::pane {{
+        /* Adjustments tabs */
+        QWidget#adjustIconBar {{
+            background-color: {ui_panel_bg};
+            border-bottom: 1px solid {ui_border};
+        }}
+        QWidget#adjustIconBar QToolButton {{
             border: none;
-            background-color: #25272b;
+            padding: 6px 10px;
+            color: {text_secondary};
+            font-weight: 500;
+            font-size: 13px;
         }}
-        QTabWidget#rightTabs::tab-bar {{
-            alignment: center;
-        }}
-        QTabWidget#rightTabs > QTabBar::tab {{
-            min-width: 32px;
-            max-width: 32px;
-            min-height: 32px;
-            max-height: 32px;
-            margin: 0;
-            padding: 0;
-            background-color: #2b2d31;
-            border: 1px solid #33363a;
-        }}
-        QTabWidget#rightTabs > QTabBar::tab:selected {{
-            background-color: #2f8fff;
-            border-color: #2f8fff;
-        }}
-        QTabWidget#rightTabs > QTabBar::tab:hover:!selected {{
-            background-color: #34373d;
+        QWidget#adjustIconBar QToolButton:checked {{
+            color: {text_primary};
+            border-bottom: 2px solid transparent;
+            border-image: linear-gradient(90deg, {grad}) 1;
         }}
 
-        /* Left dock tabs */
-        QTabWidget#leftTabs::pane {{
-            border: none;
-            background-color: #242528;
-        }}
-        QTabBar::tab {{
-            background-color: #2b2c2f;
-            color: #d7d8dd;
-            padding: 4px 10px;
-            margin-right: 1px;
-        }}
-        QTabBar::tab:selected {{
-            background-color: #383a3f;
-            color: {accent};
-        }}
-        QTabBar::tab:hover:!selected {{
-            background-color: #33353a;
-        }}
-
-                /* ========== SLIDERS (DxO-style) ========== */
-
-        /* Groove: black → grey → white, rounded bar */
+        /* Sliders */
         QSlider::groove:horizontal {{
-            border: 1px solid #111111;
+            border: 1px solid {ui_border};
             height: 10px;
-            margin: 6px 10px;      /* spacing from labels */
+            margin: 6px 10px;
             border-radius: 5px;
-            background: qlineargradient(
-                x1: 0, y1: 0, x2: 1, y2: 0,
-                stop: 0   #000000,
-                stop: 0.5 #777777,
-                stop: 1   #f5f5f5
-            );
+            background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #ffffff, stop:1 #000000);
         }}
-
-        /* Let the groove gradient show through – no colored fill */
         QSlider::sub-page:horizontal {{
             border: none;
+            border-radius: 5px;
             background: transparent;
         }}
         QSlider::add-page:horizontal {{
             border: none;
-            background: transparent;
+            background: {ui_border};
+            border-radius: 5px;
         }}
-
-        /* Handle: small light-grey pill on top of the bar */
         QSlider::handle:horizontal {{
-            background: #e8e8e8;
-            border: 1px solid #3a3b3f;
+            background: {slider_handle};
+            border: 1px solid {ui_border};
             width: 14px;
-            height: 14px;
-            margin: -3px 0;        /* lets the knob overlap the bar a bit */
+            margin: -4px 0;
             border-radius: 7px;
         }}
+        QSlider::handle:horizontal:hover {{ border-color: {focus_ring}; }}
 
-        QSlider::handle:horizontal:hover {{
-            background: #ffffff;
-            border-color: #f0f0f0;
+        QSlider[gradientRole="white_level"]::groove {{
+            background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #ffffff, stop:1 #3C3C3C);
         }}
-
-        QSlider::handle:horizontal:disabled {{
-            background: #777777;
-            border-color: #555555;
+        QSlider[gradientRole="black_level"]::groove {{
+            background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #000000, stop:1 #4F4F4F);
         }}
-
-                /* ---- Color tab sliders (Hue / Sat / Lum) ---- */
-
-        /* Hue bar (rainbow gradient) */
-        QSlider#tempSlider::groove:horizontal {{
-            border: 1px solid #111111;
-            height: 10px;
-            margin: 6px 10px;
-            border-radius: 5px;
+        QSlider[gradientRole="saturation"]::groove {{
+            background: qlineargradient( x1:0, y1:0, x2:1, y2:0, stop:0 #ff0000, stop:0.14 #ff7a2f, stop:0.28 #ffed2f, stop:0.42 #2bff2b, stop:0.56 #00a3ff, stop:0.7 #5b3cff, stop:0.84 #c12aff, stop:1 #ff0000);
+        }}
+        QSlider[gradientRole="vibrance"]::groove {{
+            background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #444444, stop:1 #ff9b36);
+        }}
+        QSlider[gradientRole="temperature"]::groove {{
+            background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #1E6DFF, stop:1 #FF7A2F);
+        }}
+        QSlider[gradientRole="tint"]::groove {{
+            background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #2ecc71, stop:1 #c12aff);
+        }}
+        QSlider[gradientRole="exposure"]::groove {{
+            background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #050505, stop:1 #ffffff);
+        }}
+        QSlider[gradientRole="contrast"]::groove {{
+            background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #555555, stop:1 #f5f5f5);
+        }}
+        QSlider[gradientRole="shadows"]::groove {{
+            background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #000000, stop:1 #2F2F2F);
+        }}
+        QSlider[gradientRole="highlights"]::groove {{
+            background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #ffffff, stop:1 #999999);
+        }}
+        QSlider[gradientRole="hsl_hue"]::groove {{
             background: qlineargradient(
-                x1: 0, y1: 0, x2: 1, y2: 0,
-                stop: 0.0  #ff0000,
-                stop: 0.16 #ffff00,
-                stop: 0.33 #00ff00,
-                stop: 0.50 #00ffff,
-                stop: 0.66 #0000ff,
-                stop: 0.83 #ff00ff,
-                stop: 1.0 #ff0000
+                x1:0, y1:0, x2:1, y2:0,
+                stop:0 #ff0000,
+                stop:0.14 #ff7a2f,
+                stop:0.28 #ffed2f,
+                stop:0.42 #2bff2b,
+                stop:0.56 #00a3ff,
+                stop:0.7 #5b3cff,
+                stop:0.84 #c12aff,
+                stop:1 #ff0000
             );
         }}
-        QSlider#tempSlider::sub-page:horizontal {{
-            border: 1px solid rgba(0,0,0,80);
-            border-radius: 5px;
-            background: transparent;
+        QSlider[gradientRole="hsl_sat"]::groove {{
+            background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #4c4c4c, stop:1 #ffffff);
+        }}
+        QSlider[gradientRole="hsl_lum"]::groove {{
+            background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #000000, stop:1 #ffffff);
         }}
 
-        /* Sat / Lum: black→white ramp */
-        QSlider#tintSlider::groove:horizontal,
-        QSlider#vibranceSlider::groove:horizontal {{
-            border: 1px solid #111111;
-            height: 10px;
-            margin: 6px 10px;
-            border-radius: 5px;
+        QSlider[gradientRole="white_level"]::sub-page {{
+            background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #ffffff, stop:1 #3A3A3A);
+        }}
+        QSlider[gradientRole="black_level"]::sub-page {{
+            background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #000000, stop:1 #4F4F4F);
+        }}
+        QSlider[gradientRole="saturation"]::sub-page,
+        QSlider[gradientRole="saturation"]::groove {{
             background: qlineargradient(
-                x1: 0, y1: 0, x2: 1, y2: 0,
-                stop: 0   #000000,
-                stop: 1   #ffffff
+                x1:0, y1:0, x2:1, y2:0,
+                stop:0 #ff0000, stop:0.14 #ff7a2f, stop:0.28 #ffed2f,
+                stop:0.42 #2bff2b, stop:0.56 #00a3ff, stop:0.7 #5b3cff,
+                stop:0.84 #c12aff, stop:1 #ff0000
             );
         }}
-        QSlider#tintSlider::sub-page:horizontal,
-        QSlider#vibranceSlider::sub-page:horizontal {{
-            border: 1px solid rgba(0,0,0,120);
-            border-radius: 5px;
-            background: rgba(255,255,255,40);
+        QSlider[gradientRole="vibrance"]::sub-page {{
+            background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #444444, stop:1 #ff9b36);
+        }}
+        QSlider[gradientRole="temperature"]::sub-page {{
+            background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #1E6DFF, stop:1 #FF7A2F);
+        }}
+        QSlider[gradientRole="tint"]::sub-page {{
+            background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #2ecc71, stop:1 #c12aff);
+        }}
+        QSlider[gradientRole="exposure"]::sub-page {{
+            background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #050505, stop:1 #ffffff);
+        }}
+        QSlider[gradientRole="contrast"]::sub-page {{
+            background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #555555, stop:1 #f5f5f5);
+        }}
+        QSlider[gradientRole="shadows"]::sub-page {{
+            background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #000000, stop:1 #2F2F2F);
+        }}
+        QSlider[gradientRole="highlights"]::sub-page {{
+            background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #ffffff, stop:1 #999999);
         }}
 
-
-        QListWidget#bottomFilmstrip {{
-            background-color: #18191b;
-            border-top: 1px solid #303236;
-            padding: 3px;
+        QCheckBox {{
+            spacing: 8px;
+            font-weight: 500;
         }}
-        QListWidget#bottomFilmstrip::item {{
-            border: 1px solid transparent;
-            padding: 2px;
-            border-radius: 2px;
-        }}
-        QListWidget#bottomFilmstrip::item:selected {{
-            border: 1px solid {accent};
-            background-color: rgba(0, 180, 255, 30);
-        }}
-        QListWidget#bottomFilmstrip::item:hover:!selected {{
-            border: 1px solid #50535a;
-            background-color: #26282d;
-        }}
-        
-        QWidget#imageToolBar {{
-            background-color: #1e1f22;
-            border: 1px solid #303236;
-            border-bottom: none;
-            padding: 2px 6px;
-        }}
-        QWidget#imageToolBar QPushButton {{
-            min-width: 40px;
-            padding: 2px 6px;
-        }}
-        QWidget#imageToolBar QLabel {{
-            color: #e0e0e0;
-        }}
-
-
-        QScrollBar:horizontal, QScrollBar:vertical {{
-            background-color: #18191b;
-            border: none;
-        }}
-        QScrollBar::handle:horizontal, QScrollBar::handle:vertical {{
-            background-color: #3b3d43;
-            min-width: 20px;
-            min-height: 20px;
+        QCheckBox::indicator {{
+            width: 18px;
+            height: 18px;
             border-radius: 3px;
+            border: 1px solid #3A3A3A;
+            background-color: #2A2A2A;
+            image: none;
+            background-image: none;
         }}
-        QScrollBar::handle:hover {{
-            background-color: #4a4d55;
+        QCheckBox::indicator:hover {{
+            border: 1px solid #5A5A5A;
+            background-color: #333333;
+        }}
+        QCheckBox::indicator:checked {{
+            border: 1px solid #5A5A5A;
+            background-color: #2A2A2A;
+            {check_icon_css}
+        }}
+        QCheckBox::indicator:checked:hover {{
+            border: 1px solid #6A6A6A;
+            background-color: #343434;
+        }}
+        QCheckBox::indicator:disabled {{
+            border: 1px solid #444444;
+            background-color: #222222;
+            opacity: 0.6;
+        }}
+        QCheckBox::indicator:checked:disabled {{
+            border-color: #444444;
+            opacity: 0.45;
         }}
 
-        QPushButton {{
-            background-color: #2f3137;
-            color: #f0f0f0;
-            border-radius: 2px;
-            border: 1px solid #3d4046;
-            padding: 3px 10px;
+        QPushButton, QToolButton {{
+            background-color: {ui_control_bg};
+            border: 1px solid {ui_outline};
+            border-radius: 4px;
+            padding: 4px 10px;
+            font-weight: 500;
+            font-size: 13px;
+            color: #E4E4E4;
         }}
-        QPushButton:hover {{
-            background-color: #3a3c42;
-            border-color: {accent};
+        QPushButton:hover, QToolButton:hover {{
+            background-color: {hover_bg};
         }}
-        QPushButton:pressed {{
-            background-color: #25272b;
+        QPushButton:pressed, QToolButton:pressed {{ background-color: {pressed_bg}; }}
+        QPushButton:disabled, QToolButton:disabled {{ color: {text_disabled}; }}
+
+        QLineEdit, QSpinBox, QDoubleSpinBox, QTextEdit {{
+            background-color: {ui_control_bg};
+            border: 1px solid {ui_outline};
+            border-radius: 4px;
+            padding: 4px 6px;
+            color: {text_primary};
+            font-weight: 400;
+            font-size: 12px;
+        }}
+
+        QStatusBar {{
+            background-color: {ui_panel_bg};
+            color: {text_secondary};
+            border-top: 1px solid {ui_border};
+            font-size: 11px;
+        }}
+
+        #imageDisplay {{
+            background-color: {ui_tray_bg};
+            border: none;
+            color: {text_secondary};
+            font-weight: 400;
+            font-size: 12px;
+        }}
+        QScrollArea#imageScroll {{
+            background-color: {ui_tray_bg};
+            border: 1px solid {ui_border};
+        }}
+
+        /* Scrollbars */
+        QScrollBar:vertical, QScrollBar:horizontal {{
+            background: {ui_panel_bg};
+            border: 1px solid {ui_border};
+            padding: 2px;
+        }}
+        QScrollBar::handle:vertical, QScrollBar::handle:horizontal {{
+            background: #4B4B4B;
+            border: 1px solid {ui_border};
+            min-height: 20px;
+            border-radius: 4px;
+        }}
+        QScrollBar::add-line, QScrollBar::sub-line {{
+            background: {ui_panel_bg};
+            border: none;
+            width: 0;
+            height: 0;
+        }}
+        QScrollBar::add-page, QScrollBar::sub-page {{
+            background: {ui_panel_bg};
         }}
         """)
+
     # ---------- simple UI actions ----------
 
     def _on_toggle_filmstrip(self, checked: bool):
@@ -1412,13 +1798,14 @@ class MainWindow(QMainWindow):
 
     def show_preferences_dialog(self):
         dlg = QDialog(self)
-        dlg.setWindowTitle("Preferences - Lightroom Clone")
+        dlg.setWindowTitle("Preferences - Gradience Studio")
         layout = QFormLayout(dlg)
 
         spin = QSpinBox(dlg)
         spin.setRange(0, 120)
         spin.setSuffix(" min")
         spin.setValue(self._autosave_interval_min)
+        spin.setButtonSymbols(QSpinBox.NoButtons)
         layout.addRow("Autosave interval:", spin)
 
         buttons = QDialogButtonBox(
@@ -1460,9 +1847,9 @@ class MainWindow(QMainWindow):
         self.thumbs.clear()
         self.history_tree.clear()
         self.image_display.clear()
-        self.image_display.setText("No Image Loaded")
+        self.image_display.setText("No folder open. File → Import Folder")
 
-        self._current_params = dict(self._default_params_template)
+        self._current_params = copy.deepcopy(self._default_params_template)
         self._current_params.update({
             "levels_black": 0,
             "levels_white": 100,
@@ -1716,6 +2103,7 @@ class MainWindow(QMainWindow):
             return
 
         self._current_path = path
+        self._update_header_filename(path)
         self._preview_base_image = cache["preview"]
         self._reset_render_cache()
         self._prepare_base_arrays()
@@ -1745,12 +2133,26 @@ class MainWindow(QMainWindow):
                 "levels_linear": get("levels_linear", False),
             }
         )
+        color_state = merge_color_params(params.get("color"), params)
+        self._current_params["color"] = color_state
+        for _color in ["red", "orange", "yellow", "green", "aqua", "blue", "purple", "magenta"]:
+            hsl = color_state.get("hsl", {})
+            hue_map = hsl.get("hue", {})
+            sat_map = hsl.get("sat", {})
+            lum_map = hsl.get("lum", {})
+            self._current_params[f"hsl_hue_{_color}"] = hue_map.get(_color, get(f"hsl_hue_{_color}", 0))
+            self._current_params[f"hsl_sat_{_color}"] = sat_map.get(_color, get(f"hsl_sat_{_color}", 0))
+            self._current_params[f"hsl_lum_{_color}"] = lum_map.get(_color, get(f"hsl_lum_{_color}", 0))
 
         self._active_edit = self._ensure_active_edit_tree(path)
 
         if update_sliders and hasattr(self, "adjust_panel"):
             try:
                 self.adjust_panel.light_group.reset_ui_to_defaults()
+            except Exception:
+                pass
+            try:
+                self.adjust_panel.color_group.reset_ui_to_defaults()
             except Exception:
                 pass
 
@@ -1958,21 +2360,33 @@ class MainWindow(QMainWindow):
             rgb_norm[..., chan_idx] = sub
             rgb = rgb_norm * 255.0
 
-        
-
-        # saturation
+        # Global saturation / vibrance (Light panel)
+        lum3 = (0.299 * rgb[..., 0] + 0.587 * rgb[..., 1] + 0.114 * rgb[..., 2])[..., None]
         sat_val = params.get("saturation", 128)
         if sat_val != 128:
             sat_factor = sat_val / 128.0
             rgb = lum3 + (rgb - lum3) * sat_factor
 
-        # vibrance
         vib_val = params.get("vibrance", 128)
         if vib_val != 128:
             vib_amount = (vib_val - 128.0) / 128.0 * 0.75
             sat_dist = np.mean(np.abs(rgb - lum3), axis=-1) / 255.0
             weight = (1.0 - sat_dist)[..., None]
             rgb = lum3 + (rgb - lum3) * (1.0 + vib_amount * weight)
+
+        # Color stage (Color panel)
+        rgb_norm = np.clip(rgb / 255.0, 0.0, 1.0).astype(np.float32)
+        color_params = merge_color_params(params.get("color"), params)
+        self._current_params["color"] = color_params
+
+        rgb_norm = apply_color_white_balance(rgb_norm, color_params.get("white_balance", {}))
+        rgb_norm = apply_hsl(rgb_norm, color_params.get("hsl", {}))
+        rgb_norm = apply_selective_color(rgb_norm, color_params.get("selective_color", {}))
+        rgb_norm = apply_color_balance(rgb_norm, color_params.get("color_balance", {}))
+        rgb_norm = apply_recolor(rgb_norm, color_params.get("recolor", {}))
+        rgb_norm = apply_black_white(rgb_norm, color_params.get("black_white", {}))
+
+        rgb = np.clip(rgb_norm * 255.0, 0.0, 255.0)
 
         # write back to QImage buffer
         rgb_u8 = np.clip(rgb, 0, 255).astype(np.uint8)
@@ -1984,7 +2398,7 @@ class MainWindow(QMainWindow):
         self._update_histogram()
 
         if self._current_path:
-            params_copy = dict(params)
+            params_copy = copy.deepcopy(params)
             self._image_params[self._current_path] = params_copy
             self._edits[self._current_path] = params_copy
             self._update_history_for_current_image()
@@ -2101,6 +2515,7 @@ class MainWindow(QMainWindow):
         self._current_path = None
         self._preview_base_image = None
         self._current_pixmap = None
+        self._update_header_filename(None)
 
         count = 0
         for name in sorted(os.listdir(folder_path)):
@@ -2161,7 +2576,7 @@ class MainWindow(QMainWindow):
 
 
 
-    # ---------- Export / import (.lrc) ----------
+    # ---------- Export / import (project files) ----------
 
     def _get_active_folder(self):
         folder = getattr(self, "_current_folder", None)
@@ -2261,7 +2676,7 @@ class MainWindow(QMainWindow):
             current_key = self._encode_project_path(self._current_path)
 
         data = {
-            "schema": "ECE 277 LightRoom Project",
+            "schema": "ECE 277 Gradience Studio Project",
             "version": LRC_VERSION,
             "created_utc": datetime.utcnow().isoformat() + "Z",
             "project_root": self._project_root,
@@ -2276,13 +2691,13 @@ class MainWindow(QMainWindow):
             path, _ = QFileDialog.getSaveFileName(
                 self,
                 "Save Project",
-                os.path.join(default_folder, "project.lrc"),
-                "Lightroom Clone Project (*.lrc)",
+                os.path.join(default_folder, f"project{PROJECT_EXTENSION}"),
+                f"Gradience Studio Project (*{PROJECT_EXTENSION})",
             )
             if not path:
                 return
-            if not path.lower().endswith(".lrc"):
-                path += ".lrc"
+            if not path.lower().endswith(PROJECT_EXTENSION):
+                path += PROJECT_EXTENSION
             self._project_path = path
         else:
             path = self._project_path
@@ -2303,7 +2718,7 @@ class MainWindow(QMainWindow):
             self,
             "Open Project",
             os.path.expanduser("~"),
-            "Lightroom Clone Project (*.lrc)",
+            f"Gradience Studio Project (*{PROJECT_EXTENSION});;Legacy Lightroom Clone Project (*{LEGACY_PROJECT_EXTENSION})",
         )
         if not path:
             return
@@ -2317,7 +2732,9 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Import Failed", f"Failed to import project: {e}")
             return
 
-        if data.get("schema") != "ECE 277 LightRoom Project":
+        schema = data.get("schema")
+        valid_schemas = {"ECE 277 Gradience Studio Project", "ECE 277 LightRoom Project"}
+        if schema not in valid_schemas:
             QMessageBox.critical(self, "Import Failed", "Invalid project file.")
             return
 

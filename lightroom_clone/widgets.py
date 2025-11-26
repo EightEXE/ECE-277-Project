@@ -122,10 +122,12 @@ class HistogramWidget(QWidget):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing, False)
 
-        r = self.rect().adjusted(6, 6, -6, -6)
-        painter.fillRect(r, QColor(24, 25, 28))
+        # Neutral panel background for histogram frame
+        painter.fillRect(self.rect(), QColor(36, 36, 36))
 
-        painter.setPen(QPen(QColor(60, 62, 68)))
+        r = self.rect().adjusted(6, 6, -6, -6)
+        painter.setPen(QPen(QColor(58, 58, 58)))
+
         for i in range(1, 4):
             y = r.top() + int(r.height() * i / 4)
             painter.drawLine(r.left(), y, r.right(), y)

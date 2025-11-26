@@ -1,4 +1,4 @@
-"""Lightroom Clone application package."""
+"""Gradience Studio application package."""
 
 from .main_window import MainWindow
 

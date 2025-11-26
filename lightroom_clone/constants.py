@@ -30,5 +30,8 @@ IMAGE_EXTENSIONS = IMAGE_EXTENSIONS + RAW_EXTENSIONS
 
 LRC_VERSION = "1.0"
 
+PROJECT_EXTENSION = ".gsp"
+LEGACY_PROJECT_EXTENSION = ".lrc"
+
 # Project root defaults to the directory containing the entry script
 PROJECT_DIR = os.path.abspath(os.path.dirname(os.path.dirname(__file__)))
