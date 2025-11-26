@@ -52,7 +52,7 @@ from PySide6.QtWidgets import (
     QMenuBar,
 )
 from PySide6.QtCore import Qt, QSize, QPoint, QTimer, QDir, QEvent, QThreadPool
-from PySide6.QtGui import QPixmap, QIcon, QImageReader, QFontMetrics, QImage, QPainter, QColor, QPen, QPolygon
+from PySide6.QtGui import QPixmap, QIcon, QFontMetrics, QColor
 from PIL import Image, ExifTags
 
 from .adjustments_panel import AdjustmentsPanel
@@ -74,8 +74,12 @@ from .color_tools import (
 )
 from .utils import (
     abspath_from_base as _abspath_from_base,
-    relpath_or_same as _relpath_or_same,
+    load_linear_image as _load_linear_image,
     load_qimage_any as _load_qimage_any,
+    qimage_from_linear,
+    relpath_or_same as _relpath_or_same,
+    to_linear,
+    to_srgb,
 )
 from .widgets import HistogramWidget, ThumbnailFileSystemModel, _ThumbTask
 
@@ -211,9 +215,9 @@ class MainWindow(QMainWindow):
         self._current_folder: str | None = None
         self._current_path: str | None = None
         self._current_pixmap: QPixmap | None = None
-        self._preview_base_image: QImage | None = None
+        self._preview_base_linear: np.ndarray | None = None
 
-        self._image_cache: dict[str, dict] = {}   # path -> {"full": QImage, "preview": QImage}
+        self._image_cache: dict[str, dict] = {}   # path -> {"linear_full": np.ndarray, "preview_linear": np.ndarray}
         self._image_params: dict[str, dict] = {}  # path -> params
         self._image_parents: dict[str, QTreeWidgetItem] = {}
         self._edits: dict[str, dict] = {}         # for project export
@@ -538,7 +542,7 @@ class MainWindow(QMainWindow):
 
     def _reset_render_cache(self):
         """Clear cached base arrays/masks so they rebuild for the next image."""
-        self._base_rgb = None
+        self._base_linear = None
         self._base_lum = None
         self._L_norm = None
         self._tone_masks = {}
@@ -783,11 +787,11 @@ class MainWindow(QMainWindow):
         if not cache:
             return
 
-        # Make sure we have full image
-        if "full" not in cache:
+        # Make sure we have the linear image cached
+        if "linear_full" not in cache:
             self._ensure_image_cached(self._current_path)
             cache = self._image_cache.get(self._current_path)
-            if not cache or "full" not in cache:
+            if not cache or "linear_full" not in cache:
                 return
 
         # *** THIS is the important line ***
@@ -795,7 +799,7 @@ class MainWindow(QMainWindow):
 
         # Swap to new preview as the base for edits
         cache = self._image_cache.get(self._current_path)
-        self._preview_base_image = cache["preview"]
+        self._preview_base_linear = cache.get("preview_linear")
 
         # Recompute base arrays for the new preview size
         self._prepare_base_arrays()
@@ -1646,10 +1650,12 @@ class MainWindow(QMainWindow):
         self._ensure_image_cached(path)
         cache = self._image_cache.get(path)
         if cache:
-            img = cache["full"]
-            w = img.width()
-            h = img.height()
-            depth = img.depth()
+            linear_full = cache.get("linear_full")
+            if linear_full is not None:
+                h, w = linear_full.shape[:2]
+                depth = 32
+            else:
+                w = h = depth = 0
         else:
             w = h = depth = 0
 
@@ -1832,7 +1838,7 @@ class MainWindow(QMainWindow):
     def new_project(self):
         self._current_folder = None
         self._current_path = None
-        self._preview_base_image = None
+        self._preview_base_linear = None
         self._current_pixmap = None
         self._project_path = None
         self._project_root = None
@@ -1955,10 +1961,11 @@ class MainWindow(QMainWindow):
             parent.takeChildren()
 
         cache = self._image_cache.get(path)
+        orig_icon = QIcon()
         if cache:
-            orig_icon = QIcon(QPixmap.fromImage(cache["preview"]))
-        else:
-            orig_icon = QIcon()
+            preview_linear = cache.get("preview_linear")
+            if preview_linear is not None:
+                orig_icon = QIcon(QPixmap.fromImage(qimage_from_linear(preview_linear)))
 
         edited_icon = QIcon(
             self._current_pixmap.scaled(
@@ -2044,7 +2051,6 @@ class MainWindow(QMainWindow):
         Rebuild the preview image for a given path based on self._preview_scale.
         Keeps the full-resolution image untouched in the cache.
         """
-        # defensive default if init was interrupted
         if not hasattr(self, "_preview_scale"):
             self._preview_scale = 1.0
 
@@ -2052,24 +2058,30 @@ class MainWindow(QMainWindow):
         if not cache:
             return
 
-        img = cache["full"]
-        if img.isNull():
+        linear_full = cache.get("linear_full")
+        if linear_full is None:
             return
 
-        # Scale full image to preview size according to preview_scale
-        if self._preview_scale >= 0.999:
-            # Full-resolution preview
-            preview = img.convertToFormat(QImage.Format_RGBA8888)
+        scale = max(0.0, float(self._preview_scale or 1.0))
+        if scale >= 0.999:
+            preview_linear = linear_full
         else:
-            w = max(1, int(img.width() * self._preview_scale))
-            h = max(1, int(img.height() * self._preview_scale))
-            preview = img.scaled(
-                w, h,
-                Qt.KeepAspectRatio,
-                Qt.SmoothTransformation
-            ).convertToFormat(QImage.Format_RGBA8888)
+            preview_linear = self._resample_linear_preview(linear_full, scale)
 
-        cache["preview"] = preview
+        cache["preview_linear"] = preview_linear
+
+    def _resample_linear_preview(self, linear: np.ndarray, scale: float) -> np.ndarray:
+        """High-quality downscale using PIL with LANCZOS while preserving linear data."""
+        h, w = linear.shape[:2]
+        target_w = max(1, int(round(w * scale)))
+        target_h = max(1, int(round(h * scale)))
+
+        srgb = to_srgb(np.clip(linear, 0.0, 1.0))
+        srgb_u8 = (srgb * 255.0).round().astype(np.uint8)
+        pil_img = Image.fromarray(srgb_u8, mode="RGB")
+        resized = pil_img.resize((target_w, target_h), Image.LANCZOS)
+        resized_arr = np.asarray(resized, dtype=np.float32) / 255.0
+        return to_linear(resized_arr)
 
 
     def _ensure_image_cached(self, path: str):
@@ -2080,16 +2092,15 @@ class MainWindow(QMainWindow):
         cache = self._image_cache.get(path)
         if cache is not None:
             # If preview is missing (e.g. after we changed scale), rebuild it
-            if "preview" not in cache:
+            if "preview_linear" not in cache:
                 self._rebuild_preview_for_path(path)
             return
 
-        img = _load_qimage_any(path)
-        if img is None:
+        linear = _load_linear_image(path)
+        if linear is None:
             return
 
-        # Store full image once; preview is built from this
-        self._image_cache[path] = {"full": img}
+        self._image_cache[path] = {"linear_full": linear}
         self._rebuild_preview_for_path(path)
 
 
@@ -2104,7 +2115,7 @@ class MainWindow(QMainWindow):
 
         self._current_path = path
         self._update_header_filename(path)
-        self._preview_base_image = cache["preview"]
+        self._preview_base_linear = cache.get("preview_linear")
         self._reset_render_cache()
         self._prepare_base_arrays()
 
@@ -2166,41 +2177,36 @@ class MainWindow(QMainWindow):
         self._update_metadata_for_current()
 
         if not params:
-            self._current_pixmap = QPixmap.fromImage(self._preview_base_image)
-            self._rescale_preview()
-            self._update_histogram()
+            if self._preview_base_linear is not None:
+                self._current_pixmap = QPixmap.fromImage(
+                    qimage_from_linear(self._preview_base_linear)
+                )
+                self._rescale_preview()
+                self._update_histogram()
         else:
             self._apply_edit_params_to_current_image(params)
 
     def _prepare_base_arrays(self):
         """Compute base RGB, luminance and tone masks once per base image."""
-        if self._preview_base_image is None:
+        if self._preview_base_linear is None:
             self._reset_render_cache()
             return
 
-        img = self._preview_base_image.convertToFormat(QImage.Format_RGBA8888)
-        w = img.width()
-        h = img.height()
-        bpl = img.bytesPerLine()
-
-        ptr = img.bits()
-        # view of the QImage buffer
-        arr = np.frombuffer(ptr, dtype=np.uint8).reshape((h, bpl // 4, 4))
-        rgb = arr[:, :w, :3].astype(np.float32).copy()  # copy so it's independent
+        rgb = np.clip(self._preview_base_linear, 0.0, 1.0)
 
         lum = (
-            0.299 * rgb[..., 0] +
-            0.587 * rgb[..., 1] +
-            0.114 * rgb[..., 2]
+            0.2126 * rgb[..., 0] +
+            0.7152 * rgb[..., 1] +
+            0.0722 * rgb[..., 2]
         )
 
-        L = lum / 255.0
+        L = np.clip(lum, 0.0, 1.0)
         highlights_mask = np.clip((L - 0.5) / 0.5, 0.0, 1.0)
         shadows_mask    = np.clip((0.5 - L) / 0.5, 0.0, 1.0)
         whites_mask     = np.clip((L - 0.8) / 0.2, 0.0, 1.0)
         blacks_mask     = np.clip((0.2 - L) / 0.2, 0.0, 1.0)
 
-        self._base_rgb = rgb
+        self._base_linear = rgb.copy()
         self._base_lum = lum
         self._L_norm = L
         self._tone_masks = {
@@ -2211,48 +2217,34 @@ class MainWindow(QMainWindow):
         }
 
     def _apply_edit_params_to_current_image(self, params: dict):
-        if self._preview_base_image is None:
+        if self._preview_base_linear is None:
             return
 
         if self._current_path:
             self._active_edit = self._ensure_active_edit_tree(self._current_path)
 
-        # Make sure we have precomputed arrays
+        base_shape = self._base_linear.shape[:2] if self._base_linear is not None else (-1, -1)
+        preview_shape = self._preview_base_linear.shape[:2]
         if (
-            self._base_rgb is None
+            self._base_linear is None
             or self._base_lum is None
-            or self._preview_base_image.width() != (self._base_rgb.shape[1] if self._base_rgb is not None else -1)
-            or self._preview_base_image.height() != (self._base_rgb.shape[0] if self._base_rgb is not None else -1)
+            or preview_shape != base_shape
         ):
             self._prepare_base_arrays()
-            if self._base_rgb is None:
+            if self._base_linear is None:
                 return
 
-        # Start from base RGB every time
-        rgb = self._base_rgb.copy()
+        rgb = self._base_linear.copy()
         lum = self._base_lum
         L = self._L_norm
         lum3 = lum[..., None]
 
-        img = self._preview_base_image.convertToFormat(QImage.Format_RGBA8888)
-        w = img.width()
-        h = img.height()
-        bpl = img.bytesPerLine()
-
-        ptr = img.bits()
-        arr = np.frombuffer(ptr, dtype=np.uint8).reshape((h, bpl // 4, 4))
-        # we’ll write into arr[:, :w, :3] at the end
-
-        # ===== adjustments (same logic as before, just using cached lum/masks) =====
-
-        # temperature
         temp_val = params.get("temperature", 128)
         if temp_val != 128:
             t = (temp_val - 128.0) / 128.0 * 0.5
             rgb[..., 0] *= (1.0 + t)
             rgb[..., 2] *= (1.0 - t)
 
-        # tint
         tint_val = params.get("tint", 128)
         if tint_val != 128:
             tt = (tint_val - 128.0) / 128.0 * 0.5
@@ -2260,32 +2252,17 @@ class MainWindow(QMainWindow):
             rgb[..., 0] *= (1.0 + tt * 0.5)
             rgb[..., 2] *= (1.0 + tt * 0.5)
 
-        # exposure
         exp_val = params.get("exposure", 128)
         if exp_val != 128:
             exp_stops = (exp_val - 128) / 128.0 * 2.0
-            exp_factor = 2.0 ** exp_stops
-            rgb *= exp_factor
+            rgb *= 2.0 ** exp_stops
 
-        # contrast
         con_val = params.get("contrast", 128)
-        bc_linear = bool(params.get("bc_linear", False))
-
         if con_val != 128:
             con_factor = con_val / 128.0
+            mid = 0.5
+            rgb = (rgb - mid) * con_factor + mid
 
-            if not bc_linear:
-                # original behavior in gamma-coded space
-                mid = 128.0
-                rgb = (rgb - mid) * con_factor + mid
-            else:
-                # "Linear" mode: operate in normalized 0–1 then scale back
-                rgb_norm = rgb / 255.0
-                mid_n = 0.5
-                rgb_norm = (rgb_norm - mid_n) * con_factor + mid_n
-                rgb = rgb_norm * 255.0
-
-        # tone sliders – reuse precomputed masks
         def tone_strength(val, scale=0.5):
             return (val - 128.0) / 128.0 * scale
 
@@ -2300,12 +2277,11 @@ class MainWindow(QMainWindow):
             wm = self._tone_masks["whites"]
             bm = self._tone_masks["blacks"]
 
-            rgb += hi_s * 255.0 * hm[..., None]
-            rgb += sh_s * 255.0 * sm[..., None]
-            rgb += wh_s * 255.0 * wm[..., None]
-            rgb += bl_s * 255.0 * bm[..., None]
+            rgb += hi_s * hm[..., None]
+            rgb += sh_s * sm[..., None]
+            rgb += wh_s * wm[..., None]
+            rgb += bl_s * bm[..., None]
 
-                # ----- Levels (input/output + gamma) -----
         in_black = params.get("levels_black", 0) / 100.0
         in_white = params.get("levels_white", 100) / 100.0
         out_black = params.get("levels_out_black", 0) / 100.0
@@ -2315,11 +2291,9 @@ class MainWindow(QMainWindow):
         color_model = params.get("levels_color_model", "RGB")
         channel_name = params.get("levels_channel", "Master")
 
-        # If channel is Master, but a single-channel color model is chosen, use that
         if channel_name == "Master" and color_model in ("Red", "Green", "Blue"):
             channel_name = color_model
 
-        # figure out which channel(s) to affect: 0=R,1=G,2=B
         if channel_name == "Red":
             chan_idx = [0]
         elif channel_name == "Green":
@@ -2327,10 +2301,8 @@ class MainWindow(QMainWindow):
         elif channel_name == "Blue":
             chan_idx = [2]
         else:
-            # Master / Alpha / anything else -> all RGB channels
             chan_idx = [0, 1, 2]
 
-        # Only do work if anything differs from defaults
         if not (
             abs(in_black) < 1e-3 and
             abs(in_white - 1.0) < 1e-3 and
@@ -2338,30 +2310,22 @@ class MainWindow(QMainWindow):
             abs(out_black) < 1e-3 and
             abs(out_white - 1.0) < 1e-3
         ):
-            rgb_norm = np.clip(rgb / 255.0, 0.0, 1.0)
+            rgb_norm = np.clip(rgb, 0.0, 1.0)
             in_span = max(1e-6, in_white - in_black)
             out_span = max(1e-6, out_white - out_black)
 
-            # Slice the selected channels
             sub = rgb_norm[..., chan_idx]
-
-            # Input levels: remap [in_black, in_white] -> [0,1]
             sub = (sub - in_black) / in_span
             sub = np.clip(sub, 0.0, 1.0)
 
-            # Gamma
             if abs(gamma - 1.0) > 1e-3:
-                # Photoshop-style: midtone slider ~ 1/gamma; we'll keep it simple
                 sub = np.power(sub, 1.0 / gamma)
 
-            # Output levels: map [0,1] -> [out_black, out_white]
             sub = out_black + sub * out_span
 
             rgb_norm[..., chan_idx] = sub
-            rgb = rgb_norm * 255.0
+            rgb = rgb_norm
 
-        # Global saturation / vibrance (Light panel)
-        lum3 = (0.299 * rgb[..., 0] + 0.587 * rgb[..., 1] + 0.114 * rgb[..., 2])[..., None]
         sat_val = params.get("saturation", 128)
         if sat_val != 128:
             sat_factor = sat_val / 128.0
@@ -2370,12 +2334,11 @@ class MainWindow(QMainWindow):
         vib_val = params.get("vibrance", 128)
         if vib_val != 128:
             vib_amount = (vib_val - 128.0) / 128.0 * 0.75
-            sat_dist = np.mean(np.abs(rgb - lum3), axis=-1) / 255.0
-            weight = (1.0 - sat_dist)[..., None]
+            sat_dist = np.mean(np.abs(rgb - lum3), axis=-1)
+            weight = (1.0 - np.clip(sat_dist, 0.0, 1.0))[..., None]
             rgb = lum3 + (rgb - lum3) * (1.0 + vib_amount * weight)
 
-        # Color stage (Color panel)
-        rgb_norm = np.clip(rgb / 255.0, 0.0, 1.0).astype(np.float32)
+        rgb_norm = np.clip(rgb, 0.0, 1.0).astype(np.float32)
         color_params = merge_color_params(params.get("color"), params)
         self._current_params["color"] = color_params
 
@@ -2386,14 +2349,9 @@ class MainWindow(QMainWindow):
         rgb_norm = apply_recolor(rgb_norm, color_params.get("recolor", {}))
         rgb_norm = apply_black_white(rgb_norm, color_params.get("black_white", {}))
 
-        rgb = np.clip(rgb_norm * 255.0, 0.0, 255.0)
+        rgb = np.clip(rgb_norm, 0.0, 1.0)
 
-        # write back to QImage buffer
-        rgb_u8 = np.clip(rgb, 0, 255).astype(np.uint8)
-        arr[:, :w, :3] = rgb_u8
-
-        # keep alpha as-is
-        self._current_pixmap = QPixmap.fromImage(img)
+        self._current_pixmap = QPixmap.fromImage(qimage_from_linear(rgb))
         self._rescale_preview()
         self._update_histogram()
 
@@ -2403,14 +2361,13 @@ class MainWindow(QMainWindow):
             self._edits[self._current_path] = params_copy
             self._update_history_for_current_image()
 
-
     def _schedule_render(self):
         """Debounce rendering so rapid slider moves don't re-render every tick."""
         # 40–60 ms feels responsive but avoids spamming the CPU
         self._render_timer.start(50)
 
     def _render_current_params(self):
-        if self._preview_base_image is not None:
+        if self._preview_base_linear is not None:
             self._apply_edit_params_to_current_image(self._current_params)
 
 
@@ -2513,7 +2470,7 @@ class MainWindow(QMainWindow):
         self._current_folder = folder_path
 
         self._current_path = None
-        self._preview_base_image = None
+        self._preview_base_linear = None
         self._current_pixmap = None
         self._update_header_filename(None)
 
@@ -2605,13 +2562,16 @@ class MainWindow(QMainWindow):
                 continue
 
             self._current_path = path
-            self._preview_base_image = cache["preview"]
+            self._preview_base_linear = cache.get("preview_linear")
             self._active_edit = self._ensure_active_edit_tree(path)
 
             if params:
                 self._apply_edit_params_to_current_image(params)
             else:
-                self._current_pixmap = QPixmap.fromImage(self._preview_base_image)
+                if self._preview_base_linear is not None:
+                    self._current_pixmap = QPixmap.fromImage(
+                        qimage_from_linear(self._preview_base_linear)
+                    )
 
             self._update_history_for_current_image()
 

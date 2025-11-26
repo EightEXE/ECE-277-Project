@@ -198,7 +198,7 @@ class LightGroupWidget(QWidget):
 
     def _emit_render(self):
         """Apply current params to the image whenever a slider moves."""
-        if self._mw._preview_base_image is None:
+        if self._mw._preview_base_linear is None:
             return
 
         if hasattr(self._mw, "_render_timer"):
@@ -1025,7 +1025,7 @@ class HSLTabWidget(QWidget):
         )
 
     def _emit_render(self):
-        if self._mw._preview_base_image is None:
+        if self._mw._preview_base_linear is None:
             return
         try:
             if hasattr(self._mw, "_schedule_render"):
@@ -1330,7 +1330,7 @@ class ColorGroupWidget(QWidget):
         return state
 
     def _emit_render(self):
-        if self._mw._preview_base_image is None:
+        if self._mw._preview_base_linear is None:
             return
         try:
             if hasattr(self._mw, "_schedule_render"):
