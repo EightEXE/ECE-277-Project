@@ -1,12 +1,16 @@
+import base64
 import copy
+from io import BytesIO
 import numpy as np
 from typing import TYPE_CHECKING, Optional
 
-from PySide6.QtCore import Qt, QEvent
+from PySide6.QtCore import Qt, QEvent, Signal
 from PySide6.QtWidgets import (
     QCheckBox,
+    QColorDialog,
     QComboBox,
     QDoubleSpinBox,
+    QFileDialog,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -20,8 +24,11 @@ from PySide6.QtWidgets import (
     QStackedWidget,
     QToolButton,
     QButtonGroup,
+    QSizePolicy,
+    QStyle,
 )
-from PySide6.QtGui import QIcon
+from PySide6.QtGui import QIcon, QColor, QPainter, QPen, QBrush, QLinearGradient, QPixmap
+from PIL import Image
 
 from .widgets import CollapsibleSection
 from .color_tools import (
@@ -201,16 +208,13 @@ class LightGroupWidget(QWidget):
         if self._mw._preview_base_linear is None:
             return
 
-        if hasattr(self._mw, "_render_timer"):
-            try:
-                self._mw._schedule_render()
-            except Exception as exc:
-                print("[LightGroupWidget] schedule_render error:", exc)
-
         try:
-            self._mw._apply_edit_params_to_current_image(self._mw._current_params)
+            if hasattr(self._mw, "_on_edit_params_changed"):
+                self._mw._on_edit_params_changed()
+            elif hasattr(self._mw, "_schedule_render"):
+                self._mw._schedule_render()
         except Exception as exc:
-            print("[LightGroupWidget] direct render error:", exc)
+            print("[LightGroupWidget] render error:", exc)
 
     def _effect_label(self, key: str) -> str:
         return self._effect_labels.get(key, key.replace("_", " ").title())
@@ -329,7 +333,9 @@ class LightGroupWidget(QWidget):
 
         # Store into main parameter dict so the render engine reads it
         self._mw._current_params.update(params)
-        if hasattr(self._mw, "_schedule_render"):
+        if hasattr(self._mw, "_on_edit_params_changed"):
+            self._mw._on_edit_params_changed()
+        elif hasattr(self._mw, "_schedule_render"):
             self._mw._schedule_render()
         else:
             self._mw._apply_edit_params_to_current_image(self._mw._current_params)
@@ -1021,14 +1027,16 @@ class HSLTabWidget(QWidget):
         slider.setMinimumWidth(120)
         slider.setStyleSheet(
             "QSlider::groove:horizontal{height:4px; margin:0 4px;}"
-            "QSlider::handle:horizontal{width:10px; margin:-6px 0;}"
+            "QSlider::handle:horizontal{width:12px; height:12px; min-width:12px; min-height:12px; max-width:12px; max-height:12px; margin:-7px 0; border-radius:6px;}"
         )
 
     def _emit_render(self):
         if self._mw._preview_base_linear is None:
             return
         try:
-            if hasattr(self._mw, "_schedule_render"):
+            if hasattr(self._mw, "_on_edit_params_changed"):
+                self._mw._on_edit_params_changed()
+            elif hasattr(self._mw, "_schedule_render"):
                 self._mw._schedule_render()
             else:
                 self._mw._apply_edit_params_to_current_image(self._mw._current_params)
@@ -1089,7 +1097,7 @@ class HSLTabWidget(QWidget):
             self._compact_slider(slider)
 
             param_key = f"hsl_{kind}_{color_key}"
-            slider.setProperty("gradientRole", f"hsl_{kind}")
+            slider.setProperty("gradientRole", f"hsl_{kind}_{color_key}")
             slider.valueChanged.connect(lambda v, key=param_key: self._update_param(key, int(v)))
 
             row.addWidget(lbl)
@@ -1333,7 +1341,9 @@ class ColorGroupWidget(QWidget):
         if self._mw._preview_base_linear is None:
             return
         try:
-            if hasattr(self._mw, "_schedule_render"):
+            if hasattr(self._mw, "_on_edit_params_changed"):
+                self._mw._on_edit_params_changed()
+            elif hasattr(self._mw, "_schedule_render"):
                 self._mw._schedule_render()
             else:
                 self._mw._apply_edit_params_to_current_image(self._mw._current_params)
@@ -1778,42 +1788,1125 @@ class ColorGroupWidget(QWidget):
         return slider, spin
 
 
+# Detail/FX group implementations injected below
+
+
+class CurveGraphWidget(QFrame):
+    """Lightroom-style point curve editor with add/move/remove interactions."""
+
+    pointsChanged = Signal(list)
+
+    def __init__(self, parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self.setMinimumHeight(200)
+        self.setFrameShape(QFrame.StyledPanel)
+        self.setObjectName("curveGraph")
+        self._points: list[tuple[float, float]] = [(0.0, 0.0), (1.0, 1.0)]
+        self._channel = "rgb"
+        self._drag_idx: int | None = None
+        self._dragging = False
+        self._point_radius = 6
+        self._padding = 12
+
+    def set_channel(self, channel: str):
+        self._channel = channel
+        self.update()
+
+    def set_points(self, points: list[tuple[float, float]]):
+        self._points = self._normalize_points(points)
+        self.update()
+
+    def points(self) -> list[tuple[float, float]]:
+        return list(self._points)
+
+    # ---------- math helpers ----------
+
+    def _normalize_points(self, points: list[tuple[float, float]]) -> list[tuple[float, float]]:
+        norm: list[tuple[float, float]] = []
+        for pt in points or []:
+            try:
+                x, y = pt
+            except Exception:
+                continue
+            x = float(max(0.0, min(1.0, x)))
+            y = float(max(0.0, min(1.0, y)))
+            norm.append((x, y))
+
+        if not norm:
+            norm = [(0.0, 0.0), (1.0, 1.0)]
+
+        norm = sorted(norm, key=lambda p: p[0])
+        dedup: list[tuple[float, float]] = []
+        last_x: float | None = None
+        for x, y in norm:
+            if last_x is not None and abs(x - last_x) < 1e-4:
+                dedup[-1] = (x, y)
+            else:
+                dedup.append((x, y))
+            last_x = x
+
+        if dedup[0][0] > 0.0:
+            dedup.insert(0, (0.0, dedup[0][1]))
+        if dedup[-1][0] < 1.0:
+            dedup.append((1.0, dedup[-1][1]))
+        return dedup
+
+    def _curve_samples(self, samples: int = 256) -> np.ndarray:
+        pts = self._normalize_points(self._points)
+        if len(pts) < 2:
+            x = np.linspace(0.0, 1.0, samples, dtype=np.float32)
+            return np.stack([x, x], axis=1)
+
+        xs = np.array([p[0] for p in pts], dtype=np.float32)
+        ys = np.array([p[1] for p in pts], dtype=np.float32)
+        dx = np.diff(xs)
+        dy = np.diff(ys)
+        slopes = dy / np.where(np.abs(dx) < 1e-6, 1e-6, dx)
+        m = np.zeros_like(xs)
+        m[0] = slopes[0]
+        m[-1] = slopes[-1]
+        for i in range(1, len(xs) - 1):
+            if slopes[i - 1] * slopes[i] <= 0:
+                m[i] = 0.0
+            else:
+                m[i] = (2 * slopes[i - 1] * slopes[i]) / (slopes[i - 1] + slopes[i])
+
+        t_vals = np.linspace(0.0, 1.0, samples, dtype=np.float32)
+        out = np.zeros((samples, 2), dtype=np.float32)
+        out[:, 0] = t_vals
+        for idx, tx in enumerate(t_vals):
+            seg = int(np.clip(np.searchsorted(xs, tx) - 1, 0, len(xs) - 2))
+            h = xs[seg + 1] - xs[seg]
+            if h <= 0:
+                out[idx, 1] = ys[seg]
+                continue
+            t = (tx - xs[seg]) / h
+            t2 = t * t
+            t3 = t2 * t
+            h00 = 2 * t3 - 3 * t2 + 1
+            h10 = t3 - 2 * t2 + t
+            h01 = -2 * t3 + 3 * t2
+            h11 = t3 - t2
+            out[idx, 1] = (
+                h00 * ys[seg]
+                + h10 * h * m[seg]
+                + h01 * ys[seg + 1]
+                + h11 * h * m[seg + 1]
+            )
+        out[:, 1] = np.clip(out[:, 1], 0.0, 1.0)
+        return out
+
+    # ---------- painting ----------
+
+    def _canvas_rect(self):
+        return self.rect().adjusted(self._padding, self._padding, -self._padding, -self._padding)
+
+    def _to_canvas(self, pt: tuple[float, float]):
+        r = self._canvas_rect()
+        x = r.left() + pt[0] * r.width()
+        y = r.bottom() - pt[1] * r.height()
+        return x, y
+
+    def paintEvent(self, event):  # noqa: N802
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        bg = QColor(26, 26, 26)
+        painter.fillRect(self.rect(), bg)
+
+        inner = self._canvas_rect()
+        painter.fillRect(inner, QColor(34, 34, 34))
+
+        grid_pen = QPen(QColor(60, 60, 60))
+        painter.setPen(grid_pen)
+        for i in range(1, 4):
+            x = inner.left() + inner.width() * i / 4.0
+            y = inner.top() + inner.height() * i / 4.0
+            painter.drawLine(int(x), inner.top(), int(x), inner.bottom())
+            painter.drawLine(inner.left(), int(y), inner.right(), int(y))
+
+        diag_pen = QPen(QColor(90, 90, 90))
+        diag_pen.setStyle(Qt.DashLine)
+        painter.setPen(diag_pen)
+        painter.drawLine(inner.bottomLeft(), inner.topRight())
+
+        samples = self._curve_samples(256)
+        accent = {
+            "rgb": QColor(188, 160, 255),
+            "r": QColor(255, 120, 120),
+            "g": QColor(120, 210, 140),
+            "b": QColor(120, 170, 255),
+        }.get(self._channel, QColor(188, 160, 255))
+        curve_pen = QPen(accent)
+        curve_pen.setWidth(2)
+        painter.setPen(curve_pen)
+        last_pt = None
+        for x_norm, y_norm in samples:
+            x, y = self._to_canvas((x_norm, y_norm))
+            if last_pt is not None:
+                painter.drawLine(int(last_pt[0]), int(last_pt[1]), int(x), int(y))
+            last_pt = (x, y)
+
+        painter.setBrush(accent)
+        painter.setPen(QPen(QColor(18, 18, 18), 1))
+        for pt in self._points:
+            cx, cy = self._to_canvas(pt)
+            r = self._point_radius
+            painter.drawEllipse(int(cx - r), int(cy - r), int(2 * r), int(2 * r))
+
+    # ---------- interactions ----------
+
+    def _pos_to_norm(self, pos):
+        inner = self._canvas_rect()
+        x = (pos.x() - inner.left()) / max(1.0, inner.width())
+        y = (inner.bottom() - pos.y()) / max(1.0, inner.height())
+        return float(max(0.0, min(1.0, x))), float(max(0.0, min(1.0, y)))
+
+    def _point_at(self, pos, tol_px: float = 10.0) -> int | None:
+        best = None
+        best_dist = tol_px * tol_px
+        for idx, pt in enumerate(self._points):
+            cx, cy = self._to_canvas(pt)
+            dx = pos.x() - cx
+            dy = pos.y() - cy
+            dist2 = dx * dx + dy * dy
+            if dist2 <= best_dist:
+                best = idx
+                best_dist = dist2
+        return best
+
+    def mousePressEvent(self, event):  # noqa: N802
+        pos = event.position() if hasattr(event, "position") else event.pos()
+        idx = self._point_at(pos)
+        if event.button() == Qt.RightButton:
+            if idx is not None and 0 < idx < len(self._points) - 1 and len(self._points) > 2:
+                pts = list(self._points)
+                pts.pop(idx)
+                self._points = self._normalize_points(pts)
+                self.pointsChanged.emit([(float(x), float(y)) for x, y in self._points])
+                self.update()
+            return
+
+        if idx is not None:
+            self._drag_idx = idx
+            self._dragging = True
+            return
+
+        x, y = self._pos_to_norm(pos)
+        pts = list(self._points) + [(x, y)]
+        self._points = self._normalize_points(pts)
+        self._drag_idx = None
+        for i, pt in enumerate(self._points):
+            if abs(pt[0] - x) < 1e-4 and abs(pt[1] - y) < 1e-4:
+                self._drag_idx = i
+                break
+        self.pointsChanged.emit([(float(px), float(py)) for px, py in self._points])
+        self._dragging = True
+        self.update()
+
+    def mouseMoveEvent(self, event):  # noqa: N802
+        if not self._dragging or self._drag_idx is None:
+            return
+        pos = event.position() if hasattr(event, "position") else event.pos()
+        x, y = self._pos_to_norm(pos)
+        pts = list(self._points)
+        idx = int(self._drag_idx)
+        if idx == 0:
+            x = 0.0
+        elif idx == len(pts) - 1:
+            x = 1.0
+        else:
+            min_x = pts[idx - 1][0] + 1e-3
+            max_x = pts[idx + 1][0] - 1e-3
+            x = max(min_x, min(max_x, x))
+        pts[idx] = (x, y)
+        self._points = self._normalize_points(pts)
+        self.pointsChanged.emit([(float(px), float(py)) for px, py in self._points])
+        self.update()
+
+    def mouseReleaseEvent(self, event):  # noqa: N802
+        self._dragging = False
+        self._drag_idx = None
+
+
+class GradientStopBar(QFrame):
+    """Preview bar + handles for gradient map stops."""
+
+    stopSelected = Signal(int)
+    stopsChanged = Signal(list)
+
+    def __init__(self, parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self._stops: list[dict] = [
+            {"pos": 0.0, "color": (0, 0, 0), "opacity": 1.0},
+            {"pos": 1.0, "color": (255, 255, 255), "opacity": 1.0},
+        ]
+        self._selected = 0
+        self._dragging = False
+        self.setFixedHeight(54)
+        self.setFrameShape(QFrame.StyledPanel)
+
+    def stops(self) -> list[dict]:
+        return list(self._stops)
+
+    def set_stops(self, stops: list[dict]):
+        self._stops = self._normalize_stops(stops)
+        self._selected = min(self._selected, len(self._stops) - 1)
+        self.update()
+
+    def _normalize_stops(self, stops: list[dict]) -> list[dict]:
+        if not stops:
+            stops = [
+                {"pos": 0.0, "color": (0, 0, 0), "opacity": 1.0},
+                {"pos": 1.0, "color": (255, 255, 255), "opacity": 1.0},
+            ]
+        norm = []
+        for st in stops:
+            pos = float(st.get("pos", 0.0))
+            col = st.get("color", (0, 0, 0))
+            opacity = float(st.get("opacity", 1.0))
+            try:
+                r, g, b = col
+            except Exception:
+                r, g, b = 0, 0, 0
+            norm.append({
+                "pos": max(0.0, min(1.0, pos)),
+                "color": (int(r), int(g), int(b)),
+                "opacity": max(0.0, min(1.0, opacity)),
+            })
+        norm = sorted(norm, key=lambda s: s["pos"])
+        if norm[0]["pos"] > 0.0:
+            norm.insert(0, {"pos": 0.0, "color": norm[0]["color"], "opacity": norm[0]["opacity"]})
+        if norm[-1]["pos"] < 1.0:
+            norm.append({"pos": 1.0, "color": norm[-1]["color"], "opacity": norm[-1]["opacity"]})
+        return norm
+
+    def _gradient_rect(self):
+        return self.rect().adjusted(12, 14, -12, -14)
+
+    def paintEvent(self, event):  # noqa: N802
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        painter.fillRect(self.rect(), QColor(30, 30, 30))
+
+        r = self._gradient_rect()
+        grad = QLinearGradient(r.left(), 0, r.right(), 0)
+        for st in self._stops:
+            col = QColor(*st["color"])
+            col.setAlphaF(st.get("opacity", 1.0))
+            grad.setColorAt(st["pos"], col)
+        painter.fillRect(r, grad)
+        painter.setPen(QPen(QColor(60, 60, 60)))
+        painter.drawRect(r)
+
+        for idx, st in enumerate(self._stops):
+            x = r.left() + st["pos"] * r.width()
+            top = r.bottom() + 2
+            color = QColor(*st["color"])
+            painter.setPen(QPen(QColor(255, 255, 255) if idx == self._selected else QColor(80, 80, 80)))
+            painter.setBrush(color)
+            painter.drawEllipse(int(x - 6), int(top), 12, 12)
+
+    def _pos_to_norm(self, pos) -> float:
+        r = self._gradient_rect()
+        return float(max(0.0, min(1.0, (pos.x() - r.left()) / max(1.0, r.width()))))
+
+    def _stop_at(self, pos, tol_px: float = 10.0) -> int | None:
+        r = self._gradient_rect()
+        best = None
+        best_dist = tol_px * tol_px
+        for idx, st in enumerate(self._stops):
+            x = r.left() + st["pos"] * r.width()
+            y = r.bottom() + 8
+            dx = pos.x() - x
+            dy = pos.y() - y
+            dist2 = dx * dx + dy * dy
+            if dist2 <= best_dist:
+                best = idx
+                best_dist = dist2
+        return best
+
+    def mousePressEvent(self, event):  # noqa: N802
+        pos = event.position() if hasattr(event, "position") else event.pos()
+        idx = self._stop_at(pos)
+        if event.button() == Qt.RightButton:
+            if idx is not None and len(self._stops) > 2 and idx not in (0, len(self._stops) - 1):
+                self._stops.pop(idx)
+                self._selected = max(0, min(self._selected, len(self._stops) - 1))
+                self.stopsChanged.emit(self._stops)
+                self.update()
+            return
+
+        if idx is None:
+            pos_norm = self._pos_to_norm(pos)
+            color = self._color_at(pos_norm)
+            self._stops.append({"pos": pos_norm, "color": color, "opacity": 1.0})
+            self._stops = self._normalize_stops(self._stops)
+            idx = min(range(len(self._stops)), key=lambda i: abs(self._stops[i]["pos"] - pos_norm))
+
+        self._selected = idx
+        self._dragging = True
+        self.stopSelected.emit(idx)
+        self.stopsChanged.emit(self._stops)
+        self.update()
+
+    def mouseMoveEvent(self, event):  # noqa: N802
+        if not self._dragging:
+            return
+        pos = event.position() if hasattr(event, "position") else event.pos()
+        idx = int(self._selected)
+        pos_norm = self._pos_to_norm(pos)
+        min_pos = self._stops[idx - 1]["pos"] + 1e-3 if idx > 0 else 0.0
+        max_pos = self._stops[idx + 1]["pos"] - 1e-3 if idx < len(self._stops) - 1 else 1.0
+        pos_norm = max(min_pos, min(max_pos, pos_norm))
+        self._stops[idx]["pos"] = pos_norm
+        self._stops = self._normalize_stops(self._stops)
+        self.stopsChanged.emit(self._stops)
+        self.update()
+
+    def mouseReleaseEvent(self, event):  # noqa: N802
+        self._dragging = False
+
+    def _color_at(self, pos_norm: float) -> tuple[int, int, int]:
+        stops = self._normalize_stops(self._stops)
+        left = stops[0]
+        right = stops[-1]
+        for i in range(len(stops) - 1):
+            if stops[i]["pos"] <= pos_norm <= stops[i + 1]["pos"]:
+                left = stops[i]
+                right = stops[i + 1]
+                break
+        t = 0.0 if right["pos"] == left["pos"] else (pos_norm - left["pos"]) / (right["pos"] - left["pos"])
+        lr, lg, lb = left["color"]
+        rr, rg, rb = right["color"]
+        r = int(lr + (rr - lr) * t)
+        g = int(lg + (rg - lg) * t)
+        b = int(lb + (rb - lb) * t)
+        return (r, g, b)
+
+
+class GradientEditorWidget(QWidget):
+    """Gradient map editor: preview bar + stop controls."""
+
+    stopsChanged = Signal(list)
+
+    def __init__(self, parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self._stop_bar = GradientStopBar(self)
+        self._stop_bar.stopsChanged.connect(self._on_stops_changed)
+        self._stop_bar.stopSelected.connect(self._on_stop_selected)
+        self._selected_idx = 0
+
+        v = QVBoxLayout(self)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(8)
+        v.addWidget(self._stop_bar)
+
+        controls = QHBoxLayout()
+        controls.setSpacing(6)
+        self.pos_slider = QSlider(Qt.Horizontal)
+        self.pos_slider.setRange(0, 100)
+        self.pos_slider.valueChanged.connect(self._on_position_changed)
+        self.pos_spin = QDoubleSpinBox()
+        self.pos_spin.setRange(0.0, 1.0)
+        self.pos_spin.setSingleStep(0.01)
+        self.pos_spin.setDecimals(3)
+        self.pos_spin.setButtonSymbols(QDoubleSpinBox.NoButtons)
+        self.pos_spin.valueChanged.connect(self._on_position_spin_changed)
+        controls.addWidget(QLabel("Position"))
+        controls.addWidget(self.pos_slider, 1)
+        controls.addWidget(self.pos_spin)
+        v.addLayout(controls)
+
+        color_row = QHBoxLayout()
+        color_row.setSpacing(6)
+        self.color_btn = QPushButton("Pick Color")
+        self.color_btn.clicked.connect(self._on_pick_color)
+        self.opacity_slider = QSlider(Qt.Horizontal)
+        self.opacity_slider.setRange(0, 100)
+        self.opacity_slider.setValue(100)
+        self.opacity_slider.valueChanged.connect(self._on_opacity_changed)
+        self.opacity_spin = QSpinBox()
+        self.opacity_spin.setRange(0, 100)
+        self.opacity_spin.setValue(100)
+        self.opacity_spin.setButtonSymbols(QSpinBox.NoButtons)
+        self.opacity_spin.valueChanged.connect(self.opacity_slider.setValue)
+        self.opacity_slider.valueChanged.connect(self.opacity_spin.setValue)
+
+        color_row.addWidget(self.color_btn)
+        color_row.addSpacing(8)
+        color_row.addWidget(QLabel("Opacity"))
+        color_row.addWidget(self.opacity_slider, 1)
+        color_row.addWidget(self.opacity_spin)
+        v.addLayout(color_row)
+
+        self._sync_controls_from_stop()
+
+    def set_stops(self, stops: list[dict]):
+        self._stop_bar.set_stops(stops)
+        self._selected_idx = min(self._selected_idx, len(self._stop_bar.stops()) - 1)
+        self._sync_controls_from_stop()
+
+    def stops(self) -> list[dict]:
+        return self._stop_bar.stops()
+
+    def _on_stops_changed(self, stops: list[dict]):
+        self._sync_controls_from_stop()
+        self.stopsChanged.emit(stops)
+
+    def _on_stop_selected(self, idx: int):
+        self._selected_idx = idx
+        self._sync_controls_from_stop()
+
+    def _sync_controls_from_stop(self):
+        stops = self._stop_bar.stops()
+        if not stops:
+            return
+        self._selected_idx = max(0, min(self._selected_idx, len(stops) - 1))
+        st = stops[self._selected_idx]
+        self.pos_slider.blockSignals(True)
+        self.pos_spin.blockSignals(True)
+        self.opacity_slider.blockSignals(True)
+        self.opacity_spin.blockSignals(True)
+
+        self.pos_slider.setValue(int(round(st["pos"] * 100)))
+        self.pos_spin.setValue(float(st["pos"]))
+        opacity_pct = int(round(st.get("opacity", 1.0) * 100))
+        self.opacity_slider.setValue(opacity_pct)
+        self.opacity_spin.setValue(opacity_pct)
+        self._set_color_button_color(QColor(*st["color"]))
+
+        self.pos_slider.blockSignals(False)
+        self.pos_spin.blockSignals(False)
+        self.opacity_slider.blockSignals(False)
+        self.opacity_spin.blockSignals(False)
+
+    def _set_color_button_color(self, color: QColor):
+        pm = QPixmap(16, 16)
+        pm.fill(color)
+        self.color_btn.setIcon(QIcon(pm))
+
+    def _update_stop(self, updater):
+        stops = self._stop_bar.stops()
+        if not stops:
+            return
+        idx = max(0, min(self._selected_idx, len(stops) - 1))
+        updater(stops[idx])
+        self._stop_bar.set_stops(stops)
+        self._stop_bar.stopSelected.emit(idx)
+        self.stopsChanged.emit(self._stop_bar.stops())
+        self._sync_controls_from_stop()
+
+    def _on_position_changed(self, value: int):
+        val = float(value) / 100.0
+        self.pos_spin.blockSignals(True)
+        self.pos_spin.setValue(val)
+        self.pos_spin.blockSignals(False)
+        self._update_stop(lambda st: st.__setitem__("pos", val))
+
+    def _on_position_spin_changed(self, value: float):
+        self.pos_slider.blockSignals(True)
+        self.pos_slider.setValue(int(round(value * 100)))
+        self.pos_slider.blockSignals(False)
+        self._update_stop(lambda st: st.__setitem__("pos", float(value)))
+
+    def _on_pick_color(self):
+        stops = self._stop_bar.stops()
+        if not stops:
+            return
+        idx = max(0, min(self._selected_idx, len(stops) - 1))
+        current = stops[idx]["color"]
+        color = QColorDialog.getColor(QColor(*current), parent=self)
+        if color.isValid():
+            self._set_color_button_color(color)
+            self._update_stop(lambda st, c=color: st.__setitem__("color", (c.red(), c.green(), c.blue())))
+
+    def _on_opacity_changed(self, value: int):
+        val = max(0.0, min(1.0, value / 100.0))
+        self.opacity_spin.blockSignals(True)
+        self.opacity_spin.setValue(int(round(val * 100)))
+        self.opacity_spin.blockSignals(False)
+        self._update_stop(lambda st: st.__setitem__("opacity", val))
+
+
+# Tone/geometry/FX classes follow
+
+
 class ToneGroupWidget(BaseGroupWidget):
-    """GROUP 3 — TONE stub."""
+    """GROUP 3 - DETAIL (Curves, Mixer, Gradient Map, Split Toning, Normals)."""
 
     def __init__(self, mw: "MainWindow", parent=None):
         super().__init__(parent)
         self._mw = mw
-        for name in ["Curves", "Channel Mixer", "Gradient Map", "Split Toning"]:
-            page = QWidget()
-            v = QVBoxLayout(page)
-            v.addWidget(QLabel(f"{name} tab coming soon…"))
-            v.addStretch(1)
-            self.add_tab(page, name)
+        self._defaults = self._detail_defaults()
+        self._param_sliders: dict[str, QSlider] = {}
+        self._chmix_sliders: dict[str, QSlider] = {}
+        self._split_sliders: dict[str, QSlider] = {}
+        self._normal_sliders: dict[str, QSlider] = {}
+        self._curve_points: dict[str, list[tuple[float, float]]] = {}
+        self._current_curve_channel = "rgb"
+
+        self._curve_canvas = CurveGraphWidget(self)
+        self._curve_canvas.pointsChanged.connect(self._on_curve_points_changed)
+
+        self._gradient_editor = GradientEditorWidget(self)
+        self._gradient_editor.stopsChanged.connect(self._on_gradient_stops_changed)
+
+        self.add_tab(self._build_curves_tab(), "Curves")
+        self.add_tab(self._build_channel_mixer_tab(), "Channel Mixer")
+        self.add_tab(self._build_gradient_map_tab(), "Gradient Map")
+        self.add_tab(self._build_split_toning_tab(), "Split Toning")
+        self.add_tab(self._build_normals_tab(), "Normals")
+
+    # ---------- shared helpers ----------
+
+    def _detail_defaults(self) -> dict:
+        return {
+            "curve_param_highlights": 0,
+            "curve_param_lights": 0,
+            "curve_param_darks": 0,
+            "curve_param_shadows": 0,
+            "curve_points_rgb": [(0.0, 0.0), (1.0, 1.0)],
+            "curve_points_r": [(0.0, 0.0), (1.0, 1.0)],
+            "curve_points_g": [(0.0, 0.0), (1.0, 1.0)],
+            "curve_points_b": [(0.0, 0.0), (1.0, 1.0)],
+            "chmix_red_r": 100,
+            "chmix_red_g": 0,
+            "chmix_red_b": 0,
+            "chmix_green_r": 0,
+            "chmix_green_g": 100,
+            "chmix_green_b": 0,
+            "chmix_blue_r": 0,
+            "chmix_blue_g": 0,
+            "chmix_blue_b": 100,
+            "grad_stops": [
+                {"pos": 0.0, "color": (0, 0, 0), "opacity": 1.0},
+                {"pos": 1.0, "color": (255, 255, 255), "opacity": 1.0},
+            ],
+            "grad_blend_mode": "Normal",
+            "grad_opacity": 0,
+            "split_shadow_hue": 0,
+            "split_shadow_sat": 0,
+            "split_mid_hue": 0,
+            "split_mid_sat": 0,
+            "split_high_hue": 0,
+            "split_high_sat": 0,
+            "split_balance": 0,
+            "normal_light_x": 0,
+            "normal_light_y": 0,
+            "normal_light_elev": 50,
+            "normal_intensity": 100,
+            "normal_specular": 0,
+            "normal_diffuse": 100,
+            "normal_map": None,
+        }
+
+    def _emit_render(self):
+        if self._mw._preview_base_linear is None:
+            return
+        try:
+            if hasattr(self._mw, "_on_edit_params_changed"):
+                self._mw._on_edit_params_changed(immediate_preview=True)
+            elif hasattr(self._mw, "_render_preview"):
+                self._mw._render_preview()
+            if hasattr(self._mw, "_schedule_full_render"):
+                self._mw._schedule_full_render()
+        except Exception as exc:
+            print("[ToneGroupWidget] render error:", exc)
+
+    def _update_param(self, key: str, value):
+        self._mw._current_params[key] = value
+        self._emit_render()
+
+    def _curve_key_for_channel(self, channel: str) -> str:
+        mapping = {"rgb": "curve_points_rgb", "r": "curve_points_r", "g": "curve_points_g", "b": "curve_points_b"}
+        return mapping.get(channel, "curve_points_rgb")
+
+    # ---------- Curves ----------
+
+    def _build_parametric_row(self, label: str, key: str, gradient_role: str | None = None):
+        row = QHBoxLayout()
+        lbl = QLabel(label)
+        slider = QSlider(Qt.Horizontal)
+        slider.setRange(-100, 100)
+        slider.setValue(self._mw._current_params.get(key, self._defaults[key]))
+        slider.setFixedHeight(12)
+        if gradient_role:
+            slider.setProperty("gradientRole", gradient_role)
+        spin = QSpinBox()
+        spin.setRange(-100, 100)
+        spin.setValue(slider.value())
+        spin.setButtonSymbols(QSpinBox.NoButtons)
+        spin.setFixedWidth(64)
+        slider.valueChanged.connect(spin.setValue)
+        spin.valueChanged.connect(slider.setValue)
+        slider.valueChanged.connect(lambda v, k=key: self._update_param(k, int(v)))
+        row.addWidget(lbl)
+        row.addWidget(slider, 1)
+        row.addWidget(spin)
+        self._param_sliders[key] = slider
+        return row
+
+    def _on_curve_channel_selected(self, channel: str):
+        self._current_curve_channel = channel
+        key = self._curve_key_for_channel(channel)
+        pts = self._mw._current_params.get(key, self._defaults[key])
+        self._curve_canvas.set_channel(channel)
+        self._curve_canvas.set_points(pts)
+
+    def _on_curve_points_changed(self, pts: list[tuple[float, float]]):
+        key = self._curve_key_for_channel(self._current_curve_channel)
+        clean = [(float(x), float(y)) for x, y in pts]
+        self._mw._current_params[key] = clean
+        self._curve_points[key] = clean
+        self._emit_render()
+
+    def _reset_curve_points(self):
+        key = self._curve_key_for_channel(self._current_curve_channel)
+        default = self._defaults.get(key, [(0.0, 0.0), (1.0, 1.0)])
+        self._mw._current_params[key] = list(default)
+        self._curve_canvas.set_points(default)
+        self._emit_render()
+
+    def _build_curves_tab(self) -> QWidget:
+        page = QWidget()
+        scroll = QScrollArea()
+        scroll.setObjectName("adjustScroll")
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+
+        container = QWidget()
+        container.setObjectName("adjustScrollContainer")
+        v = QVBoxLayout(container)
+        v.setContentsMargins(4, 4, 4, 4)
+        v.setSpacing(6)
+
+        param_section = CollapsibleSection("Parametric Curve", self, start_collapsed=False)
+        pl = param_section.content_layout()
+        pl.addLayout(self._build_parametric_row("Highlights", "curve_param_highlights", "highlights"))
+        pl.addLayout(self._build_parametric_row("Lights", "curve_param_lights", "highlights"))
+        pl.addLayout(self._build_parametric_row("Darks", "curve_param_darks", "shadows"))
+        pl.addLayout(self._build_parametric_row("Shadows", "curve_param_shadows", "shadows"))
+        v.addWidget(param_section)
+
+        point_section = CollapsibleSection("Point Curve Editor", self, start_collapsed=False)
+        pcl = point_section.content_layout()
+        btn_row = QHBoxLayout()
+        self._curve_channel_buttons: dict[str, QToolButton] = {}
+        for key, text in [("rgb", "RGB Master"), ("r", "Red"), ("g", "Green"), ("b", "Blue")]:
+            btn = QToolButton()
+            btn.setCheckable(True)
+            btn.setAutoRaise(True)
+            btn.setText(text)
+            btn.setMinimumWidth(70)
+            btn.clicked.connect(lambda checked, ch=key: self._on_curve_channel_selected(ch))
+            self._curve_channel_buttons[key] = btn
+            btn_row.addWidget(btn)
+        self._curve_channel_buttons["rgb"].setChecked(True)
+        reset_btn = QPushButton("Reset Curve")
+        reset_btn.setIcon(self.style().standardIcon(QStyle.SP_BrowserReload))
+        reset_btn.clicked.connect(self._reset_curve_points)
+        btn_row.addStretch(1)
+        btn_row.addWidget(reset_btn)
+        pcl.addLayout(btn_row)
+        pcl.addWidget(self._curve_canvas)
+        hint = QLabel("Left-click to add/move points. Right-click to remove.")
+        hint.setStyleSheet("color: #bbbbbb; font-size: 11px;")
+        pcl.addWidget(hint)
+        v.addWidget(point_section)
+
+        v.addStretch(1)
+        scroll.setWidget(container)
+
+        root = QVBoxLayout(page)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+        root.addWidget(scroll)
+
+        self._on_curve_channel_selected("rgb")
+        return page
+
+    # ---------- Channel Mixer ----------
+
+    def _add_chmix_row(self, label: str, key: str, parent_layout: QVBoxLayout):
+        row = QHBoxLayout()
+        lbl = QLabel(label)
+        slider = QSlider(Qt.Horizontal)
+        slider.setRange(-200, 200)
+        slider.setValue(int(self._mw._current_params.get(key, self._defaults[key])))
+        slider.setFixedHeight(12)
+        spin = QSpinBox()
+        spin.setRange(-200, 200)
+        spin.setValue(slider.value())
+        spin.setButtonSymbols(QSpinBox.NoButtons)
+        spin.setFixedWidth(64)
+        slider.valueChanged.connect(spin.setValue)
+        spin.valueChanged.connect(slider.setValue)
+        slider.valueChanged.connect(lambda v, k=key: self._update_param(k, int(v)))
+        row.addWidget(lbl)
+        row.addWidget(slider, 1)
+        row.addWidget(spin)
+        parent_layout.addLayout(row)
+        self._chmix_sliders[key] = slider
+
+    def _build_channel_group(self, title: str, keys: dict[str, str]) -> CollapsibleSection:
+        section = CollapsibleSection(title, self, start_collapsed=False)
+        cl = section.content_layout()
+        self._add_chmix_row("Red → " + title.split()[0], keys["r"], cl)
+        self._add_chmix_row("Green → " + title.split()[0], keys["g"], cl)
+        self._add_chmix_row("Blue → " + title.split()[0], keys["b"], cl)
+        return section
+
+    def _build_channel_mixer_tab(self) -> QWidget:
+        page = QWidget()
+        scroll = QScrollArea()
+        scroll.setObjectName("adjustScroll")
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        container = QWidget()
+        container.setObjectName("adjustScrollContainer")
+        v = QVBoxLayout(container)
+        v.setContentsMargins(4, 4, 4, 4)
+        v.setSpacing(6)
+
+        v.addWidget(self._build_channel_group("Red Output Channel", {
+            "r": "chmix_red_r",
+            "g": "chmix_red_g",
+            "b": "chmix_red_b",
+        }))
+        v.addWidget(self._build_channel_group("Green Output Channel", {
+            "r": "chmix_green_r",
+            "g": "chmix_green_g",
+            "b": "chmix_green_b",
+        }))
+        v.addWidget(self._build_channel_group("Blue Output Channel", {
+            "r": "chmix_blue_r",
+            "g": "chmix_blue_g",
+            "b": "chmix_blue_b",
+        }))
+
+        v.addStretch(1)
+        scroll.setWidget(container)
+        root = QVBoxLayout(page)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+        root.addWidget(scroll)
+        return page
+
+    # ---------- Gradient Map ----------
+
+    def _on_gradient_stops_changed(self, stops: list[dict]):
+        self._mw._current_params["grad_stops"] = stops
+        self._emit_render()
+
+    def _build_gradient_map_tab(self) -> QWidget:
+        page = QWidget()
+        scroll = QScrollArea()
+        scroll.setObjectName("adjustScroll")
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        container = QWidget()
+        container.setObjectName("adjustScrollContainer")
+        v = QVBoxLayout(container)
+        v.setContentsMargins(4, 4, 4, 4)
+        v.setSpacing(6)
+
+        grad_section = CollapsibleSection("Gradient Editor", self, start_collapsed=False)
+        gl = grad_section.content_layout()
+        self._gradient_editor.set_stops(self._mw._current_params.get("grad_stops", self._defaults["grad_stops"]))
+        gl.addWidget(self._gradient_editor)
+        v.addWidget(grad_section)
+
+        blend_section = CollapsibleSection("Blend Options", self, start_collapsed=False)
+        bl = blend_section.content_layout()
+        blend_row = QHBoxLayout()
+        blend_row.addWidget(QLabel("Blend Mode"))
+        self.grad_mode_combo = QComboBox()
+        modes = ["Normal", "Soft Light", "Overlay", "Multiply", "Screen"]
+        self.grad_mode_combo.addItems(modes)
+        current_mode = self._mw._current_params.get("grad_blend_mode", self._defaults["grad_blend_mode"])
+        if current_mode in modes:
+            self.grad_mode_combo.setCurrentText(current_mode)
+        self.grad_mode_combo.currentTextChanged.connect(lambda text: self._update_param("grad_blend_mode", text))
+        blend_row.addWidget(self.grad_mode_combo)
+        blend_row.addStretch(1)
+        bl.addLayout(blend_row)
+
+        op_row = QHBoxLayout()
+        op_row.addWidget(QLabel("Opacity"))
+        self.grad_opacity_slider = QSlider(Qt.Horizontal)
+        self.grad_opacity_slider.setRange(0, 100)
+        self.grad_opacity_slider.setValue(int(self._mw._current_params.get("grad_opacity", 100)))
+        self.grad_opacity_slider.setFixedHeight(12)
+        self.grad_opacity_spin = QSpinBox()
+        self.grad_opacity_spin.setRange(0, 100)
+        self.grad_opacity_spin.setValue(self.grad_opacity_slider.value())
+        self.grad_opacity_spin.setButtonSymbols(QSpinBox.NoButtons)
+        self.grad_opacity_spin.setFixedWidth(64)
+        self.grad_opacity_slider.valueChanged.connect(self.grad_opacity_spin.setValue)
+        self.grad_opacity_spin.valueChanged.connect(self.grad_opacity_slider.setValue)
+        self.grad_opacity_slider.valueChanged.connect(lambda v: self._update_param("grad_opacity", int(v)))
+        op_row.addWidget(self.grad_opacity_slider, 1)
+        op_row.addWidget(self.grad_opacity_spin)
+        bl.addLayout(op_row)
+
+        v.addWidget(blend_section)
+        v.addStretch(1)
+        scroll.setWidget(container)
+        root = QVBoxLayout(page)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+        root.addWidget(scroll)
+        return page
+
+    # ---------- Split Toning ----------
+
+    def _add_split_row(self, layout: QVBoxLayout, label: str, key: str, min_val: int, max_val: int, suffix: str = ""):
+        row = QHBoxLayout()
+        lbl = QLabel(label)
+        slider = QSlider(Qt.Horizontal)
+        slider.setRange(min_val, max_val)
+        slider.setValue(int(self._mw._current_params.get(key, self._defaults[key])))
+        slider.setFixedHeight(12)
+        spin = QSpinBox()
+        spin.setRange(min_val, max_val)
+        spin.setValue(slider.value())
+        if suffix:
+            spin.setSuffix(suffix)
+        spin.setButtonSymbols(QSpinBox.NoButtons)
+        spin.setFixedWidth(64)
+        slider.valueChanged.connect(spin.setValue)
+        spin.valueChanged.connect(slider.setValue)
+        slider.valueChanged.connect(lambda v, k=key: self._update_param(k, int(v)))
+        row.addWidget(lbl)
+        row.addWidget(slider, 1)
+        row.addWidget(spin)
+        layout.addLayout(row)
+        self._split_sliders[key] = slider
+
+    def _build_split_section(self, title: str, hue_key: str, sat_key: str) -> CollapsibleSection:
+        section = CollapsibleSection(title, self, start_collapsed=False)
+        cl = section.content_layout()
+        self._add_split_row(cl, "Hue", hue_key, 0, 360, "°")
+        self._add_split_row(cl, "Saturation", sat_key, 0, 100, "")
+        return section
+
+    def _build_split_toning_tab(self) -> QWidget:
+        page = QWidget()
+        scroll = QScrollArea()
+        scroll.setObjectName("adjustScroll")
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        container = QWidget()
+        container.setObjectName("adjustScrollContainer")
+        v = QVBoxLayout(container)
+        v.setContentsMargins(4, 4, 4, 4)
+        v.setSpacing(6)
+
+        v.addWidget(self._build_split_section("Shadows", "split_shadow_hue", "split_shadow_sat"))
+        v.addWidget(self._build_split_section("Midtones", "split_mid_hue", "split_mid_sat"))
+        v.addWidget(self._build_split_section("Highlights", "split_high_hue", "split_high_sat"))
+
+        balance_section = CollapsibleSection("Balance", self, start_collapsed=False)
+        bl = balance_section.content_layout()
+        self._add_split_row(bl, "Balance", "split_balance", -100, 100)
+        v.addWidget(balance_section)
+
+        v.addStretch(1)
+        scroll.setWidget(container)
+        root = QVBoxLayout(page)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+        root.addWidget(scroll)
+        return page
+
+    # ---------- Normals ----------
+
+    def _encode_normal_map(self, normal: np.ndarray) -> dict:
+        normal01 = np.clip(normal, 0.0, 1.0)
+        u8 = (normal01 * 255.0).round().astype(np.uint8)
+        h, w = u8.shape[:2]
+        img = Image.fromarray(u8, mode="RGB")
+        buf = BytesIO()
+        img.save(buf, format="PNG")
+        encoded = base64.b64encode(buf.getvalue()).decode("ascii")
+        return {"data": encoded, "width": w, "height": h, "encoding": "base64_png"}
+
+    def _set_normal_map(self, normal: np.ndarray):
+        payload = self._encode_normal_map(normal)
+        self._mw._current_params["normal_map"] = payload
+        self._emit_render()
+
+    def _generate_normals_from_image(self):
+        base = self._mw._preview_base_linear or self._mw._base_image
+        if base is None:
+            return
+        src = np.clip(np.asarray(base, dtype=np.float32), 0.0, 1.0)
+        lum = (
+            0.2126 * src[..., 0] +
+            0.7152 * src[..., 1] +
+            0.0722 * src[..., 2]
+        )
+        lum_small = lum
+        max_dim = 768
+        h, w = lum.shape
+        scale = min(1.0, max_dim / max(h, w))
+        if scale < 0.999:
+            small_w = max(1, int(w * scale))
+            small_h = max(1, int(h * scale))
+            img = Image.fromarray((lum * 255.0).astype(np.uint8))
+            img = img.resize((small_w, small_h), Image.BILINEAR)
+            lum_small = np.asarray(img, dtype=np.float32) / 255.0
+
+        gx = np.gradient(lum_small, axis=1)
+        gy = np.gradient(lum_small, axis=0)
+        nz = np.ones_like(lum_small)
+        normal = np.stack((-gx, -gy, nz), axis=-1)
+        norm = np.linalg.norm(normal, axis=-1, keepdims=True)
+        norm = np.where(norm < 1e-6, 1.0, norm)
+        normal = normal / norm
+        normal01 = normal * 0.5 + 0.5
+        self._set_normal_map(normal01)
+
+    def _load_normal_map(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Load Normal Map", "", "Images (*.png *.jpg *.jpeg *.bmp)")
+        if not path:
+            return
+        try:
+            img = Image.open(path).convert("RGB")
+            normal = np.asarray(img, dtype=np.float32) / 255.0
+            self._set_normal_map(normal)
+        except Exception as exc:
+            print("[ToneGroupWidget] Failed to load normal map:", exc)
+
+    def _build_normal_row(self, label: str, key: str, min_val: int, max_val: int, default: int):
+        row = QHBoxLayout()
+        lbl = QLabel(label)
+        slider = QSlider(Qt.Horizontal)
+        slider.setRange(min_val, max_val)
+        slider.setValue(int(self._mw._current_params.get(key, default)))
+        slider.setFixedHeight(12)
+        spin = QDoubleSpinBox() if (max_val - min_val) <= 200 else QSpinBox()
+        if isinstance(spin, QDoubleSpinBox):
+            spin.setDecimals(2)
+            spin.setSingleStep(0.05)
+            spin.setRange(min_val / 100.0, max_val / 100.0)
+            spin.setValue(slider.value() / 100.0)
+            slider.valueChanged.connect(lambda v, s=spin: s.setValue(v / 100.0))
+            spin.valueChanged.connect(lambda v, sld=slider: sld.setValue(int(round(v * 100.0))))
+        else:
+            spin.setRange(min_val, max_val)
+            spin.setValue(slider.value())
+            slider.valueChanged.connect(spin.setValue)
+            spin.valueChanged.connect(slider.setValue)
+        spin.setButtonSymbols(QSpinBox.NoButtons)
+        spin.setFixedWidth(70)
+        slider.valueChanged.connect(lambda v, k=key: self._update_param(k, int(v)))
+        row.addWidget(lbl)
+        row.addWidget(slider, 1)
+        row.addWidget(spin)
+        self._normal_sliders[key] = slider
+        return row
+
+    def _build_normals_tab(self) -> QWidget:
+        page = QWidget()
+        scroll = QScrollArea()
+        scroll.setObjectName("adjustScroll")
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        container = QWidget()
+        container.setObjectName("adjustScrollContainer")
+        v = QVBoxLayout(container)
+        v.setContentsMargins(4, 4, 4, 4)
+        v.setSpacing(6)
+
+        recon = CollapsibleSection("Normals Reconstruction", self, start_collapsed=False)
+        rl = recon.content_layout()
+        btn_row = QHBoxLayout()
+        gen_btn = QPushButton("Generate Normals from Image")
+        gen_btn.setIcon(self.style().standardIcon(QStyle.SP_FileDialogDetailedView))
+        gen_btn.clicked.connect(self._generate_normals_from_image)
+        load_btn = QPushButton("Load Normal Map…")
+        load_btn.setIcon(self.style().standardIcon(QStyle.SP_DialogOpenButton))
+        load_btn.clicked.connect(self._load_normal_map)
+        btn_row.addWidget(gen_btn)
+        btn_row.addWidget(load_btn)
+        btn_row.addStretch(1)
+        rl.addLayout(btn_row)
+        v.addWidget(recon)
+
+        relight = CollapsibleSection("Relight Controls", self, start_collapsed=False)
+        rl2 = relight.content_layout()
+        rl2.addLayout(self._build_normal_row("Light Direction X", "normal_light_x", -100, 100, 0))
+        rl2.addLayout(self._build_normal_row("Light Direction Y", "normal_light_y", -100, 100, 0))
+        rl2.addLayout(self._build_normal_row("Light Elevation", "normal_light_elev", 0, 100, 50))
+        rl2.addLayout(self._build_normal_row("Intensity", "normal_intensity", 0, 200, 100))
+        rl2.addLayout(self._build_normal_row("Specular Boost", "normal_specular", 0, 200, 0))
+        rl2.addLayout(self._build_normal_row("Diffuse Strength", "normal_diffuse", 0, 200, 100))
+        v.addWidget(relight)
+
+        v.addStretch(1)
+        scroll.setWidget(container)
+        root = QVBoxLayout(page)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+        root.addWidget(scroll)
+        return page
+
+    # ---------- UI helpers ----------
+
+    def reset_ui_to_defaults(self):
+        for key, slider in self._param_sliders.items():
+            slider.blockSignals(True)
+            slider.setValue(self._defaults.get(key, 0))
+            slider.blockSignals(False)
+
+        for key, slider in self._chmix_sliders.items():
+            slider.blockSignals(True)
+            slider.setValue(self._defaults.get(key, 0))
+            slider.blockSignals(False)
+
+        for key, slider in self._split_sliders.items():
+            slider.blockSignals(True)
+            slider.setValue(self._defaults.get(key, 0))
+            slider.blockSignals(False)
+
+        for key, slider in self._normal_sliders.items():
+            slider.blockSignals(True)
+            slider.setValue(self._defaults.get(key, slider.value()))
+            slider.blockSignals(False)
+
+        self._gradient_editor.set_stops(self._defaults["grad_stops"])
+        self.grad_mode_combo.setCurrentText(self._defaults["grad_blend_mode"])
+        self.grad_opacity_slider.setValue(self._defaults["grad_opacity"])
+        for ch in ["rgb", "r", "g", "b"]:
+            key = self._curve_key_for_channel(ch)
+            self._mw._current_params[key] = list(self._defaults[key])
+        self._on_curve_channel_selected(self._current_curve_channel)
+        self._emit_render()
 
 
 class GeometryGroupWidget(BaseGroupWidget):
-    """GROUP 4 — GEOMETRY stub."""
+    """GROUP 4 - GEOMETRY stub (kept for compatibility)."""
 
     def __init__(self, mw: "MainWindow", parent=None):
         super().__init__(parent)
         self._mw = mw
         page = QWidget()
         v = QVBoxLayout(page)
-        v.addWidget(QLabel("Normals tab coming soon…"))
+        v.addWidget(QLabel("Normals tab is available under Detail -> Normals."))
         v.addStretch(1)
         self.add_tab(page, "Normals")
 
 
 class FXGroupWidget(BaseGroupWidget):
-    """GROUP 5 — FX stub."""
+    """GROUP 5 - FX stub."""
 
     def __init__(self, mw: "MainWindow", parent=None):
         super().__init__(parent)
         self._mw = mw
         page = QWidget()
         v = QVBoxLayout(page)
-        v.addWidget(QLabel("Lens Filter tab coming soon…"))
+        v.addWidget(QLabel("Lens Filter tab coming soon..."))
         v.addStretch(1)
         self.add_tab(page, "Lens Filter")
 

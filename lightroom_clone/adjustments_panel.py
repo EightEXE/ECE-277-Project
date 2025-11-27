@@ -14,7 +14,7 @@ from PySide6.QtWidgets import (
     QSizePolicy,
 )
 
-from .groups import FXGroupWidget, GeometryGroupWidget, LightGroupWidget, ColorGroupWidget, ToneGroupWidget
+from .groups import FXGroupWidget, LightGroupWidget, ColorGroupWidget, ToneGroupWidget
 
 
 class AdjustmentsPanel(QWidget):
@@ -69,21 +69,12 @@ class AdjustmentsPanel(QWidget):
         self.light_group = LightGroupWidget(self._mw)
         self.color_group = ColorGroupWidget(self._mw)
         self.tone_group = ToneGroupWidget(self._mw)
-        self.geometry_group = GeometryGroupWidget(self._mw)
         self.fx_group = FXGroupWidget(self._mw)
-
-        detail_container = QWidget()
-        detail_container.setObjectName("adjustDetailContainer")
-        detail_layout = QVBoxLayout(detail_container)
-        detail_layout.setContentsMargins(0, 0, 0, 0)
-        detail_layout.setSpacing(6)
-        detail_layout.addWidget(self.tone_group)
-        detail_layout.addWidget(self.geometry_group)
 
         groups = [
             (self.light_group, "Light", "icons/light.png"),
             (self.color_group, "Color", "icons/color.png"),
-            (detail_container, "Detail", "icons/detail.png"),
+            (self.tone_group, "Detail", "icons/detail.png"),
             (self.fx_group, "FX", "icons/fx.png"),
         ]
 

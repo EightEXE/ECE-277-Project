@@ -15,9 +15,63 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+from PIL import Image
 
 from .constants import IMAGE_EXTENSIONS
 from .utils import load_qimage_any
+
+# Optional CUDA for thumbnail scaling
+try:
+    from numba import cuda  # type: ignore
+    _CUDA_AVAILABLE = cuda.is_available()
+except Exception:
+    _CUDA_AVAILABLE = False
+    cuda = None
+
+_USE_CUDA_THUMBS = _CUDA_AVAILABLE and os.environ.get("GS_USE_CUDA_THUMBS", "0") == "1"
+
+
+def _mipped_resize_pil(pil: Image.Image, target_w: int, target_h: int) -> Image.Image:
+    """Downsample progressively to avoid expensive single huge resize."""
+    w, h = pil.size
+    target_long = max(target_w, target_h)
+    while min(w, h) > target_long * 2:
+        w = max(target_w, w // 2)
+        h = max(target_h, h // 2)
+        pil = pil.resize((w, h), Image.BILINEAR)
+    return pil.resize((target_w, target_h), Image.LANCZOS)
+
+
+def set_cuda_thumbs_enabled(enabled: bool) -> bool:
+    """Allow runtime toggling of CUDA thumbnail scaling."""
+    global _USE_CUDA_THUMBS
+    _USE_CUDA_THUMBS = bool(enabled) and _CUDA_AVAILABLE
+    return _USE_CUDA_THUMBS
+
+
+def get_cuda_thumbs_enabled() -> bool:
+    return bool(_USE_CUDA_THUMBS and _CUDA_AVAILABLE)
+
+
+if _CUDA_AVAILABLE:
+    @cuda.jit(fastmath=True)
+    def _thumb_resize_nearest(src, dst):
+        y, x = cuda.grid(2)
+        if y >= dst.shape[0] or x >= dst.shape[1]:
+            return
+        src_h = src.shape[0]
+        src_w = src.shape[1]
+        scale_y = src_h / dst.shape[0]
+        scale_x = src_w / dst.shape[1]
+        sy = int(y * scale_y)
+        sx = int(x * scale_x)
+        if sy >= src_h:
+            sy = src_h - 1
+        if sx >= src_w:
+            sx = src_w - 1
+        dst[y, x, 0] = src[sy, sx, 0]
+        dst[y, x, 1] = src[sy, sx, 1]
+        dst[y, x, 2] = src[sy, sx, 2]
 
 
 class CollapsibleSection(QWidget):
@@ -208,12 +262,46 @@ class _ThumbTask(QRunnable):
         self.signals = _WorkerSignals()
 
     def run(self):
+        icon = QIcon()
+        target_w = max(1, self.size.width())
+        target_h = max(1, self.size.height())
+
+        # Skip CUDA for very small thumbs to avoid GPU under-utilization warnings
+        use_cuda = _USE_CUDA_THUMBS and (target_w * target_h >= 4096)
+
+        if use_cuda:
+            try:
+                pil = Image.open(self.path).convert("RGB")
+                pil = _mipped_resize_pil(pil, target_w, target_h * 2)  # slight overshoot for crop-then-CUDA
+                arr = np.asarray(pil, dtype=np.uint8)
+                d_in = cuda.to_device(arr)
+                d_out = cuda.device_array((target_h, target_w, 3), dtype=np.uint8)
+                threads = (16, 16)
+                blocks = (
+                    (target_w + threads[0] - 1) // threads[0],
+                    (target_h + threads[1] - 1) // threads[1],
+                )
+                _thumb_resize_nearest[blocks, threads](d_in, d_out)
+                out = d_out.copy_to_host()
+                img = QImage(out.data, target_w, target_h, 3 * target_w, QImage.Format_RGB888).copy()
+                icon = QIcon(QPixmap.fromImage(img))
+                self.signals.ready.emit(self.path, icon)
+                return
+            except Exception as exc:  # pragma: no cover - safety net
+                # Corrupt or unsupported images should silently fall back to CPU path
+                use_cuda = False
+
         img = load_qimage_any(self.path)
-        if img is None:
-            icon = QIcon()
-        else:
-            img = img.scaled(self.size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        if img is not None:
+            # build a mip-like downscale before final quality resize
+            try:
+                pil = Image.fromqimage(img)
+                pil = _mipped_resize_pil(pil, target_w, target_h)
+                img = pil.toqimage()
+            except Exception:
+                img = img.scaled(self.size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
             icon = QIcon(QPixmap.fromImage(img))
+
         self.signals.ready.emit(self.path, icon)
 
 
@@ -223,4 +311,6 @@ __all__ = [
     "ThumbnailFileSystemModel",
     "_ThumbTask",
     "_WorkerSignals",
+    "set_cuda_thumbs_enabled",
+    "get_cuda_thumbs_enabled",
 ]
