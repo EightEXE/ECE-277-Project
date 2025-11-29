@@ -4,7 +4,7 @@ from io import BytesIO
 import numpy as np
 from typing import TYPE_CHECKING, Optional
 
-from PySide6.QtCore import Qt, QEvent, Signal
+from PySide6.QtCore import Qt, QEvent, Signal, QSize
 from PySide6.QtWidgets import (
     QCheckBox,
     QColorDialog,
@@ -26,6 +26,7 @@ from PySide6.QtWidgets import (
     QButtonGroup,
     QSizePolicy,
     QStyle,
+    QGridLayout,
 )
 from PySide6.QtGui import QIcon, QColor, QPainter, QPen, QBrush, QLinearGradient, QPixmap
 from PIL import Image
@@ -121,6 +122,7 @@ class LightGroupWidget(QWidget):
     def __init__(self, mw: "MainWindow", parent=None):
         super().__init__(parent)
         self._mw = mw
+        self._sections: dict[str, CollapsibleSection] = {}
 
         self._levels_state: dict[tuple[str, str], dict] = {}
         self._levels_target: tuple[str, str] | None = None
@@ -158,39 +160,49 @@ class LightGroupWidget(QWidget):
         scroll.setObjectName("adjustScroll")
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
 
         container = QWidget()
         container.setObjectName("adjustScrollContainer")
+        container.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         v = QVBoxLayout(container)
         v.setContentsMargins(4, 4, 4, 4)
         v.setSpacing(6)
 
-        levels_section = CollapsibleSection("Levels", self, start_collapsed=False)
+        levels_section = CollapsibleSection("Levels", self, start_collapsed=True)
         levels_section.content_layout().addWidget(self._build_levels_panel())
+        self._sections["Levels"] = levels_section
         v.addWidget(levels_section)
 
-        wb_section = CollapsibleSection("White Balance", self, start_collapsed=False)
+        wb_section = CollapsibleSection("White Balance", self, start_collapsed=True)
         wb_section.content_layout().addWidget(self._build_white_balance_panel())
+        self._sections["White Balance"] = wb_section
         v.addWidget(wb_section)
 
         bc_section = CollapsibleSection("Brightness / Contrast", self, start_collapsed=True)
         bc_section.content_layout().addWidget(self._build_bright_contrast_panel())
+        self._sections["Brightness / Contrast"] = bc_section
         v.addWidget(bc_section)
 
         exp_section = CollapsibleSection("Exposure", self, start_collapsed=True)
         exp_section.content_layout().addWidget(self._build_exposure_panel())
+        self._sections["Exposure"] = exp_section
         v.addWidget(exp_section)
 
         sh_section = CollapsibleSection("Shadows / Highlights", self, start_collapsed=True)
         sh_section.content_layout().addWidget(self._build_shadows_highlights_panel())
+        self._sections["Shadows / Highlights"] = sh_section
         v.addWidget(sh_section)
 
         vib_section = CollapsibleSection("Vibrance", self, start_collapsed=True)
         vib_section.content_layout().addWidget(self._build_vibrance_panel())
+        self._sections["Vibrance"] = vib_section
         v.addWidget(vib_section)
 
         post_section = CollapsibleSection("Posterize", self, start_collapsed=True)
         post_section.content_layout().addWidget(self._build_posterize_panel())
+        self._sections["Posterize"] = post_section
         v.addWidget(post_section)
 
         v.addStretch(1)
@@ -200,6 +212,19 @@ class LightGroupWidget(QWidget):
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
         root.addWidget(scroll)
+
+    def expand_section(self, name: str):
+        sect = self._sections.get(name)
+        if sect:
+            sect._header_btn.setChecked(True)
+            sect._content.setVisible(True)
+
+    def show_only_section(self, name: str):
+        for title, sect in self._sections.items():
+            visible = (title == name)
+            sect.setHidden(not visible)
+            sect._header_btn.setChecked(visible)
+            sect._content.setVisible(visible)
 
     # ---------- shared helpers ----------
 
@@ -222,7 +247,7 @@ class LightGroupWidget(QWidget):
     def _compact_slider(self, slider: QSlider):
         """Tighten vertical footprint and set a modest minimum width."""
         slider.setFixedHeight(10)
-        slider.setMinimumWidth(120)
+        slider.setMinimumWidth(90)
         slider.setStyleSheet(
             "QSlider::groove:horizontal{height:4px; margin:0 4px;}"
             "QSlider::handle:horizontal{width:10px; margin:-6px 0;}"
@@ -996,9 +1021,11 @@ class HSLTabWidget(QWidget):
         scroll.setObjectName("adjustScroll")
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
 
         container = QWidget()
         container.setObjectName("adjustScrollContainer")
+        container.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         v = QVBoxLayout(container)
         v.setContentsMargins(4, 4, 4, 4)
         v.setSpacing(6)
@@ -1159,21 +1186,24 @@ class ColorGroupWidget(QWidget):
         super().__init__(parent)
         self._mw = mw
         self._defaults = default_color_params()
+        self._sections: dict[str, CollapsibleSection] = {}
 
         scroll = QScrollArea()
         scroll.setObjectName("adjustScroll")
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
 
         container = QWidget()
         container.setObjectName("adjustScrollContainer")
+        container.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         v = QVBoxLayout(container)
         v.setContentsMargins(4, 4, 4, 4)
         v.setSpacing(6)
 
         # HSL
         self.hsl_section = HSLTabWidget(self._mw, self, on_change=self._on_hsl_changed)
-        hsl_collapsible = CollapsibleSection("HSL", self, start_collapsed=False)
+        hsl_collapsible = CollapsibleSection("HSL", self, start_collapsed=True)
         hsl_layout = hsl_collapsible.content_layout()
         hsl_row = QHBoxLayout()
         self.hsl_enable = QCheckBox("Enable HSL")
@@ -1183,14 +1213,24 @@ class ColorGroupWidget(QWidget):
         hsl_row.addStretch(1)
         hsl_layout.addLayout(hsl_row)
         hsl_layout.addWidget(self.hsl_section)
+        self._sections["HSL"] = hsl_collapsible
         v.addWidget(hsl_collapsible)
 
         # Other color sections
-        v.addWidget(self._build_recolor_section())
-        v.addWidget(self._build_bw_section())
-        v.addWidget(self._build_selective_color_section())
-        v.addWidget(self._build_color_balance_section())
-        v.addWidget(self._build_color_wb_section())
+        recolor = self._build_recolor_section()
+        bw = self._build_bw_section()
+        selective = self._build_selective_color_section()
+        color_balance = self._build_color_balance_section()
+        color_wb = self._build_color_wb_section()
+        for name, sect in [
+            ("Recolor", recolor),
+            ("Black & White", bw),
+            ("Selective Color", selective),
+            ("Color Balance", color_balance),
+            ("White Balance", color_wb),
+        ]:
+            self._sections[name] = sect
+            v.addWidget(sect)
 
         v.addStretch(1)
         scroll.setWidget(container)
@@ -1199,6 +1239,25 @@ class ColorGroupWidget(QWidget):
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
         root.addWidget(scroll)
+
+    def expand_section(self, name: str):
+        sect = self._sections.get(name)
+        if sect:
+            sect._header_btn.setChecked(True)
+            sect._content.setVisible(True)
+
+    def show_only_section(self, name: str):
+        """Hide all sections except the requested one (for pop-out menus)."""
+        for title, sect in self._sections.items():
+            visible = (title == name)
+            sect.setHidden(not visible)
+            sect._header_btn.setChecked(visible)
+            if hasattr(sect, "_content"):
+                sect._content.setVisible(visible)
+            if visible:
+                # force expansion to show controls
+                sect._header_btn.setChecked(True)
+                sect._content.setVisible(True)
 
     # ---------- UI state helpers ----------
 
@@ -1799,6 +1858,7 @@ class CurveGraphWidget(QFrame):
     def __init__(self, parent: Optional[QWidget] = None):
         super().__init__(parent)
         self.setMinimumHeight(200)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         self.setFrameShape(QFrame.StyledPanel)
         self.setObjectName("curveGraph")
         self._points: list[tuple[float, float]] = [(0.0, 0.0), (1.0, 1.0)]
@@ -1807,6 +1867,10 @@ class CurveGraphWidget(QFrame):
         self._dragging = False
         self._point_radius = 6
         self._padding = 12
+
+    def sizeHint(self):  # noqa: D401
+        # Keep the curve editor compact so it fits within the right dock width.
+        return QSize(220, 190)
 
     def set_channel(self, channel: str):
         self._channel = channel
@@ -2044,6 +2108,7 @@ class GradientStopBar(QFrame):
         self._dragging = False
         self.setFixedHeight(54)
         self.setFrameShape(QFrame.StyledPanel)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
     def stops(self) -> list[dict]:
         return list(self._stops)
@@ -2195,6 +2260,7 @@ class GradientEditorWidget(QWidget):
         self._stop_bar.stopsChanged.connect(self._on_stops_changed)
         self._stop_bar.stopSelected.connect(self._on_stop_selected)
         self._selected_idx = 0
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
 
         v = QVBoxLayout(self)
         v.setContentsMargins(0, 0, 0, 0)
@@ -2285,6 +2351,10 @@ class GradientEditorWidget(QWidget):
         pm.fill(color)
         self.color_btn.setIcon(QIcon(pm))
 
+    def sizeHint(self):  # noqa: D401
+        # Keep controls narrow enough for the sidebar width.
+        return QSize(220, 140)
+
     def _update_stop(self, updater):
         stops = self._stop_bar.stops()
         if not stops:
@@ -2331,13 +2401,14 @@ class GradientEditorWidget(QWidget):
 # Tone/geometry/FX classes follow
 
 
-class ToneGroupWidget(BaseGroupWidget):
+class ToneGroupWidget(QWidget):
     """GROUP 3 - DETAIL (Curves, Mixer, Gradient Map, Split Toning, Normals)."""
 
     def __init__(self, mw: "MainWindow", parent=None):
         super().__init__(parent)
         self._mw = mw
         self._defaults = self._detail_defaults()
+        self._sections: dict[str, CollapsibleSection] = {}
         self._param_sliders: dict[str, QSlider] = {}
         self._chmix_sliders: dict[str, QSlider] = {}
         self._split_sliders: dict[str, QSlider] = {}
@@ -2351,11 +2422,56 @@ class ToneGroupWidget(BaseGroupWidget):
         self._gradient_editor = GradientEditorWidget(self)
         self._gradient_editor.stopsChanged.connect(self._on_gradient_stops_changed)
 
-        self.add_tab(self._build_curves_tab(), "Curves")
-        self.add_tab(self._build_channel_mixer_tab(), "Channel Mixer")
-        self.add_tab(self._build_gradient_map_tab(), "Gradient Map")
-        self.add_tab(self._build_split_toning_tab(), "Split Toning")
-        self.add_tab(self._build_normals_tab(), "Normals")
+        scroll = QScrollArea()
+        scroll.setObjectName("adjustScroll")
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+
+        container = QWidget()
+        container.setObjectName("adjustScrollContainer")
+        v = QVBoxLayout(container)
+        v.setContentsMargins(2, 2, 2, 6)
+        v.setSpacing(4)
+
+        for sect in self._build_curve_sections():
+            self._sections[sect._header_btn.text()] = sect
+            v.addWidget(sect)
+        chmix = self._build_channel_mixer_group()
+        self._sections[chmix._header_btn.text()] = chmix
+        v.addWidget(chmix)
+        grad = self._build_gradient_map_group()
+        self._sections[grad._header_btn.text()] = grad
+        v.addWidget(grad)
+        split = self._build_split_toning_group()
+        self._sections[split._header_btn.text()] = split
+        v.addWidget(split)
+        norms = self._build_normals_group()
+        self._sections[norms._header_btn.text()] = norms
+        v.addWidget(norms)
+        v.addStretch(1)
+
+        scroll.setWidget(container)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+        root.addWidget(scroll)
+
+        self._on_curve_channel_selected("rgb")
+
+    def expand_section(self, name: str):
+        sect = self._sections.get(name)
+        if sect:
+            sect._header_btn.setChecked(True)
+            sect._content.setVisible(True)
+
+    def show_only_section(self, name: str):
+        for title, sect in self._sections.items():
+            visible = (title == name)
+            sect.setHidden(not visible)
+            sect._header_btn.setChecked(visible)
+            sect._content.setVisible(visible)
 
     # ---------- shared helpers ----------
 
@@ -2400,10 +2516,24 @@ class ToneGroupWidget(BaseGroupWidget):
             "normal_map": None,
         }
 
+    def _sync_all_detail_effect(self):
+        params = {k: self._mw._current_params.get(k, default) for k, default in self._defaults.items()}
+        if params == self._defaults:
+            self._mw._remove_effect("detail:all", mask="Global")
+            return
+        self._mw._upsert_effect(
+            "detail:all",
+            "detail",
+            params,
+            mask="Global",
+            label="Detail",
+        )
+
     def _emit_render(self):
         if self._mw._preview_base_linear is None:
             return
         try:
+            self._sync_all_detail_effect()
             if hasattr(self._mw, "_on_edit_params_changed"):
                 self._mw._on_edit_params_changed(immediate_preview=True)
             elif hasattr(self._mw, "_render_preview"):
@@ -2417,6 +2547,15 @@ class ToneGroupWidget(BaseGroupWidget):
         self._mw._current_params[key] = value
         self._emit_render()
 
+    def _apply_compact_slider_style(self, slider: QSlider, min_width: int = 80):
+        """Keep sliders slim to avoid horizontal overflow."""
+        slider.setFixedHeight(10)
+        slider.setMinimumWidth(min_width)
+        slider.setStyleSheet(
+            "QSlider::groove:horizontal{height:4px; margin:0 4px;}"
+            "QSlider::handle:horizontal{width:10px; margin:-6px 0;}"
+        )
+
     def _curve_key_for_channel(self, channel: str) -> str:
         mapping = {"rgb": "curve_points_rgb", "r": "curve_points_r", "g": "curve_points_g", "b": "curve_points_b"}
         return mapping.get(channel, "curve_points_rgb")
@@ -2425,18 +2564,20 @@ class ToneGroupWidget(BaseGroupWidget):
 
     def _build_parametric_row(self, label: str, key: str, gradient_role: str | None = None):
         row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
         lbl = QLabel(label)
+        lbl.setMinimumWidth(60)
         slider = QSlider(Qt.Horizontal)
         slider.setRange(-100, 100)
         slider.setValue(self._mw._current_params.get(key, self._defaults[key]))
-        slider.setFixedHeight(12)
+        self._apply_compact_slider_style(slider, min_width=80)
         if gradient_role:
             slider.setProperty("gradientRole", gradient_role)
         spin = QSpinBox()
         spin.setRange(-100, 100)
         spin.setValue(slider.value())
         spin.setButtonSymbols(QSpinBox.NoButtons)
-        spin.setFixedWidth(64)
+        spin.setFixedWidth(46)
         slider.valueChanged.connect(spin.setValue)
         spin.valueChanged.connect(slider.setValue)
         slider.valueChanged.connect(lambda v, k=key: self._update_param(k, int(v)))
@@ -2467,43 +2608,35 @@ class ToneGroupWidget(BaseGroupWidget):
         self._curve_canvas.set_points(default)
         self._emit_render()
 
-    def _build_curves_tab(self) -> QWidget:
-        page = QWidget()
-        scroll = QScrollArea()
-        scroll.setObjectName("adjustScroll")
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.NoFrame)
+    def _build_curve_sections(self) -> list[CollapsibleSection]:
+        sections: list[CollapsibleSection] = []
 
-        container = QWidget()
-        container.setObjectName("adjustScrollContainer")
-        v = QVBoxLayout(container)
-        v.setContentsMargins(4, 4, 4, 4)
-        v.setSpacing(6)
-
-        param_section = CollapsibleSection("Parametric Curve", self, start_collapsed=False)
+        param_section = CollapsibleSection("Parametric Curve", self, start_collapsed=True)
         pl = param_section.content_layout()
         pl.addLayout(self._build_parametric_row("Highlights", "curve_param_highlights", "highlights"))
         pl.addLayout(self._build_parametric_row("Lights", "curve_param_lights", "highlights"))
         pl.addLayout(self._build_parametric_row("Darks", "curve_param_darks", "shadows"))
         pl.addLayout(self._build_parametric_row("Shadows", "curve_param_shadows", "shadows"))
-        v.addWidget(param_section)
+        sections.append(param_section)
 
-        point_section = CollapsibleSection("Point Curve Editor", self, start_collapsed=False)
+        point_section = CollapsibleSection("Point Curve Editor", self, start_collapsed=True)
         pcl = point_section.content_layout()
         btn_row = QHBoxLayout()
+        btn_row.setContentsMargins(0, 0, 0, 0)
         self._curve_channel_buttons: dict[str, QToolButton] = {}
-        for key, text in [("rgb", "RGB Master"), ("r", "Red"), ("g", "Green"), ("b", "Blue")]:
+        for key, text in [("rgb", "RGB"), ("r", "R"), ("g", "G"), ("b", "B")]:
             btn = QToolButton()
             btn.setCheckable(True)
             btn.setAutoRaise(True)
             btn.setText(text)
-            btn.setMinimumWidth(70)
+            btn.setMinimumWidth(44)
             btn.clicked.connect(lambda checked, ch=key: self._on_curve_channel_selected(ch))
             self._curve_channel_buttons[key] = btn
             btn_row.addWidget(btn)
         self._curve_channel_buttons["rgb"].setChecked(True)
-        reset_btn = QPushButton("Reset Curve")
+        reset_btn = QPushButton("Reset")
         reset_btn.setIcon(self.style().standardIcon(QStyle.SP_BrowserReload))
+        reset_btn.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Fixed)
         reset_btn.clicked.connect(self._reset_curve_points)
         btn_row.addStretch(1)
         btn_row.addWidget(reset_btn)
@@ -2512,18 +2645,9 @@ class ToneGroupWidget(BaseGroupWidget):
         hint = QLabel("Left-click to add/move points. Right-click to remove.")
         hint.setStyleSheet("color: #bbbbbb; font-size: 11px;")
         pcl.addWidget(hint)
-        v.addWidget(point_section)
+        sections.append(point_section)
 
-        v.addStretch(1)
-        scroll.setWidget(container)
-
-        root = QVBoxLayout(page)
-        root.setContentsMargins(0, 0, 0, 0)
-        root.setSpacing(0)
-        root.addWidget(scroll)
-
-        self._on_curve_channel_selected("rgb")
-        return page
+        return sections
 
     # ---------- Channel Mixer ----------
 
@@ -2533,12 +2657,12 @@ class ToneGroupWidget(BaseGroupWidget):
         slider = QSlider(Qt.Horizontal)
         slider.setRange(-200, 200)
         slider.setValue(int(self._mw._current_params.get(key, self._defaults[key])))
-        slider.setFixedHeight(12)
+        self._apply_compact_slider_style(slider, min_width=80)
         spin = QSpinBox()
         spin.setRange(-200, 200)
         spin.setValue(slider.value())
         spin.setButtonSymbols(QSpinBox.NoButtons)
-        spin.setFixedWidth(64)
+        spin.setFixedWidth(52)
         slider.valueChanged.connect(spin.setValue)
         spin.valueChanged.connect(slider.setValue)
         slider.valueChanged.connect(lambda v, k=key: self._update_param(k, int(v)))
@@ -2549,48 +2673,34 @@ class ToneGroupWidget(BaseGroupWidget):
         self._chmix_sliders[key] = slider
 
     def _build_channel_group(self, title: str, keys: dict[str, str]) -> CollapsibleSection:
-        section = CollapsibleSection(title, self, start_collapsed=False)
+        section = CollapsibleSection(title, self, start_collapsed=True)
         cl = section.content_layout()
         self._add_chmix_row("Red → " + title.split()[0], keys["r"], cl)
         self._add_chmix_row("Green → " + title.split()[0], keys["g"], cl)
         self._add_chmix_row("Blue → " + title.split()[0], keys["b"], cl)
         return section
 
-    def _build_channel_mixer_tab(self) -> QWidget:
-        page = QWidget()
-        scroll = QScrollArea()
-        scroll.setObjectName("adjustScroll")
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.NoFrame)
-        container = QWidget()
-        container.setObjectName("adjustScrollContainer")
-        v = QVBoxLayout(container)
-        v.setContentsMargins(4, 4, 4, 4)
-        v.setSpacing(6)
+    def _build_channel_mixer_group(self) -> CollapsibleSection:
+        section = CollapsibleSection("Channel Mixer", self, start_collapsed=True)
+        layout = section.content_layout()
 
-        v.addWidget(self._build_channel_group("Red Output Channel", {
+        layout.addWidget(self._build_channel_group("Red Output Channel", {
             "r": "chmix_red_r",
             "g": "chmix_red_g",
             "b": "chmix_red_b",
         }))
-        v.addWidget(self._build_channel_group("Green Output Channel", {
+        layout.addWidget(self._build_channel_group("Green Output Channel", {
             "r": "chmix_green_r",
             "g": "chmix_green_g",
             "b": "chmix_green_b",
         }))
-        v.addWidget(self._build_channel_group("Blue Output Channel", {
+        layout.addWidget(self._build_channel_group("Blue Output Channel", {
             "r": "chmix_blue_r",
             "g": "chmix_blue_g",
             "b": "chmix_blue_b",
         }))
 
-        v.addStretch(1)
-        scroll.setWidget(container)
-        root = QVBoxLayout(page)
-        root.setContentsMargins(0, 0, 0, 0)
-        root.setSpacing(0)
-        root.addWidget(scroll)
-        return page
+        return section
 
     # ---------- Gradient Map ----------
 
@@ -2598,25 +2708,17 @@ class ToneGroupWidget(BaseGroupWidget):
         self._mw._current_params["grad_stops"] = stops
         self._emit_render()
 
-    def _build_gradient_map_tab(self) -> QWidget:
-        page = QWidget()
-        scroll = QScrollArea()
-        scroll.setObjectName("adjustScroll")
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.NoFrame)
-        container = QWidget()
-        container.setObjectName("adjustScrollContainer")
-        v = QVBoxLayout(container)
-        v.setContentsMargins(4, 4, 4, 4)
-        v.setSpacing(6)
+    def _build_gradient_map_group(self) -> CollapsibleSection:
+        section = CollapsibleSection("Gradient Map", self, start_collapsed=True)
+        layout = section.content_layout()
 
-        grad_section = CollapsibleSection("Gradient Editor", self, start_collapsed=False)
+        grad_section = CollapsibleSection("Gradient Editor", self, start_collapsed=True)
         gl = grad_section.content_layout()
         self._gradient_editor.set_stops(self._mw._current_params.get("grad_stops", self._defaults["grad_stops"]))
         gl.addWidget(self._gradient_editor)
-        v.addWidget(grad_section)
+        layout.addWidget(grad_section)
 
-        blend_section = CollapsibleSection("Blend Options", self, start_collapsed=False)
+        blend_section = CollapsibleSection("Blend Options", self, start_collapsed=True)
         bl = blend_section.content_layout()
         blend_row = QHBoxLayout()
         blend_row.addWidget(QLabel("Blend Mode"))
@@ -2636,12 +2738,12 @@ class ToneGroupWidget(BaseGroupWidget):
         self.grad_opacity_slider = QSlider(Qt.Horizontal)
         self.grad_opacity_slider.setRange(0, 100)
         self.grad_opacity_slider.setValue(int(self._mw._current_params.get("grad_opacity", 100)))
-        self.grad_opacity_slider.setFixedHeight(12)
+        self._apply_compact_slider_style(self.grad_opacity_slider, min_width=80)
         self.grad_opacity_spin = QSpinBox()
         self.grad_opacity_spin.setRange(0, 100)
         self.grad_opacity_spin.setValue(self.grad_opacity_slider.value())
         self.grad_opacity_spin.setButtonSymbols(QSpinBox.NoButtons)
-        self.grad_opacity_spin.setFixedWidth(64)
+        self.grad_opacity_spin.setFixedWidth(52)
         self.grad_opacity_slider.valueChanged.connect(self.grad_opacity_spin.setValue)
         self.grad_opacity_spin.valueChanged.connect(self.grad_opacity_slider.setValue)
         self.grad_opacity_slider.valueChanged.connect(lambda v: self._update_param("grad_opacity", int(v)))
@@ -2649,14 +2751,8 @@ class ToneGroupWidget(BaseGroupWidget):
         op_row.addWidget(self.grad_opacity_spin)
         bl.addLayout(op_row)
 
-        v.addWidget(blend_section)
-        v.addStretch(1)
-        scroll.setWidget(container)
-        root = QVBoxLayout(page)
-        root.setContentsMargins(0, 0, 0, 0)
-        root.setSpacing(0)
-        root.addWidget(scroll)
-        return page
+        layout.addWidget(blend_section)
+        return section
 
     # ---------- Split Toning ----------
 
@@ -2666,14 +2762,14 @@ class ToneGroupWidget(BaseGroupWidget):
         slider = QSlider(Qt.Horizontal)
         slider.setRange(min_val, max_val)
         slider.setValue(int(self._mw._current_params.get(key, self._defaults[key])))
-        slider.setFixedHeight(12)
+        self._apply_compact_slider_style(slider, min_width=80)
         spin = QSpinBox()
         spin.setRange(min_val, max_val)
         spin.setValue(slider.value())
         if suffix:
             spin.setSuffix(suffix)
         spin.setButtonSymbols(QSpinBox.NoButtons)
-        spin.setFixedWidth(64)
+        spin.setFixedWidth(52)
         slider.valueChanged.connect(spin.setValue)
         spin.valueChanged.connect(slider.setValue)
         slider.valueChanged.connect(lambda v, k=key: self._update_param(k, int(v)))
@@ -2690,34 +2786,20 @@ class ToneGroupWidget(BaseGroupWidget):
         self._add_split_row(cl, "Saturation", sat_key, 0, 100, "")
         return section
 
-    def _build_split_toning_tab(self) -> QWidget:
-        page = QWidget()
-        scroll = QScrollArea()
-        scroll.setObjectName("adjustScroll")
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.NoFrame)
-        container = QWidget()
-        container.setObjectName("adjustScrollContainer")
-        v = QVBoxLayout(container)
-        v.setContentsMargins(4, 4, 4, 4)
-        v.setSpacing(6)
+    def _build_split_toning_group(self) -> CollapsibleSection:
+        section = CollapsibleSection("Split Toning", self, start_collapsed=True)
+        layout = section.content_layout()
 
-        v.addWidget(self._build_split_section("Shadows", "split_shadow_hue", "split_shadow_sat"))
-        v.addWidget(self._build_split_section("Midtones", "split_mid_hue", "split_mid_sat"))
-        v.addWidget(self._build_split_section("Highlights", "split_high_hue", "split_high_sat"))
+        layout.addWidget(self._build_split_section("Shadows", "split_shadow_hue", "split_shadow_sat"))
+        layout.addWidget(self._build_split_section("Midtones", "split_mid_hue", "split_mid_sat"))
+        layout.addWidget(self._build_split_section("Highlights", "split_high_hue", "split_high_sat"))
 
-        balance_section = CollapsibleSection("Balance", self, start_collapsed=False)
+        balance_section = CollapsibleSection("Balance", self, start_collapsed=True)
         bl = balance_section.content_layout()
         self._add_split_row(bl, "Balance", "split_balance", -100, 100)
-        v.addWidget(balance_section)
+        layout.addWidget(balance_section)
 
-        v.addStretch(1)
-        scroll.setWidget(container)
-        root = QVBoxLayout(page)
-        root.setContentsMargins(0, 0, 0, 0)
-        root.setSpacing(0)
-        root.addWidget(scroll)
-        return page
+        return section
 
     # ---------- Normals ----------
 
@@ -2784,7 +2866,7 @@ class ToneGroupWidget(BaseGroupWidget):
         slider = QSlider(Qt.Horizontal)
         slider.setRange(min_val, max_val)
         slider.setValue(int(self._mw._current_params.get(key, default)))
-        slider.setFixedHeight(12)
+        self._apply_compact_slider_style(slider, min_width=80)
         spin = QDoubleSpinBox() if (max_val - min_val) <= 200 else QSpinBox()
         if isinstance(spin, QDoubleSpinBox):
             spin.setDecimals(2)
@@ -2807,19 +2889,11 @@ class ToneGroupWidget(BaseGroupWidget):
         self._normal_sliders[key] = slider
         return row
 
-    def _build_normals_tab(self) -> QWidget:
-        page = QWidget()
-        scroll = QScrollArea()
-        scroll.setObjectName("adjustScroll")
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.NoFrame)
-        container = QWidget()
-        container.setObjectName("adjustScrollContainer")
-        v = QVBoxLayout(container)
-        v.setContentsMargins(4, 4, 4, 4)
-        v.setSpacing(6)
+    def _build_normals_group(self) -> CollapsibleSection:
+        section = CollapsibleSection("Normals", self, start_collapsed=True)
+        layout = section.content_layout()
 
-        recon = CollapsibleSection("Normals Reconstruction", self, start_collapsed=False)
+        recon = CollapsibleSection("Normals Reconstruction", self, start_collapsed=True)
         rl = recon.content_layout()
         btn_row = QHBoxLayout()
         gen_btn = QPushButton("Generate Normals from Image")
@@ -2832,9 +2906,9 @@ class ToneGroupWidget(BaseGroupWidget):
         btn_row.addWidget(load_btn)
         btn_row.addStretch(1)
         rl.addLayout(btn_row)
-        v.addWidget(recon)
+        layout.addWidget(recon)
 
-        relight = CollapsibleSection("Relight Controls", self, start_collapsed=False)
+        relight = CollapsibleSection("Relight Controls", self, start_collapsed=True)
         rl2 = relight.content_layout()
         rl2.addLayout(self._build_normal_row("Light Direction X", "normal_light_x", -100, 100, 0))
         rl2.addLayout(self._build_normal_row("Light Direction Y", "normal_light_y", -100, 100, 0))
@@ -2842,15 +2916,9 @@ class ToneGroupWidget(BaseGroupWidget):
         rl2.addLayout(self._build_normal_row("Intensity", "normal_intensity", 0, 200, 100))
         rl2.addLayout(self._build_normal_row("Specular Boost", "normal_specular", 0, 200, 0))
         rl2.addLayout(self._build_normal_row("Diffuse Strength", "normal_diffuse", 0, 200, 100))
-        v.addWidget(relight)
+        layout.addWidget(relight)
 
-        v.addStretch(1)
-        scroll.setWidget(container)
-        root = QVBoxLayout(page)
-        root.setContentsMargins(0, 0, 0, 0)
-        root.setSpacing(0)
-        root.addWidget(scroll)
-        return page
+        return section
 
     # ---------- UI helpers ----------
 
@@ -2886,29 +2954,469 @@ class ToneGroupWidget(BaseGroupWidget):
 
 
 class GeometryGroupWidget(BaseGroupWidget):
-    """GROUP 4 - GEOMETRY stub (kept for compatibility)."""
+    """GROUP 4 - GEOMETRY."""
 
     def __init__(self, mw: "MainWindow", parent=None):
         super().__init__(parent)
         self._mw = mw
-        page = QWidget()
-        v = QVBoxLayout(page)
-        v.addWidget(QLabel("Normals tab is available under Detail -> Normals."))
+        self._geom_defaults = copy.deepcopy(getattr(mw, "_geometry_defaults", {}))
+
+        container = QWidget()
+        v = QVBoxLayout(container)
+        v.setContentsMargins(4, 4, 4, 4)
+        v.setSpacing(6)
+        v.addWidget(self._build_transform_section())
+        v.addWidget(self._build_perspective_section())
+        v.addWidget(self._build_lens_section())
+        v.addWidget(self._build_crop_section())
+        v.addWidget(self._build_warp_section())
         v.addStretch(1)
-        self.add_tab(page, "Normals")
+
+        scroll = QScrollArea()
+        scroll.setObjectName("adjustScroll")
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setWidget(container)
+
+        self.add_tab(scroll, "Geometry")
+        self._tab_bar.hide()
+
+    # ---------- helpers ----------
+    def _geom(self) -> dict:
+        g = self._mw._current_params.get("geometry")
+        if not g:
+            g = copy.deepcopy(self._geom_defaults)
+            self._mw._current_params["geometry"] = g
+        return g
+
+    def _set_geom(self, key: str, value):
+        g = self._geom()
+        g[key] = value
+        self._emit_render()
+
+    def _emit_render(self):
+        if hasattr(self._mw, "_on_edit_params_changed"):
+            self._mw._on_edit_params_changed()
+        else:
+            self._mw._apply_edit_params_to_current_image(self._mw._current_params)
+
+    def _reset_geom(self):
+        self._mw._current_params["geometry"] = copy.deepcopy(self._geom_defaults)
+        self._emit_render()
+
+    def update_detected_lens(self, lens_name: str):
+        if hasattr(self, "lens_profile_detected_label"):
+            label = lens_name or "(none)"
+            self.lens_profile_detected_label.setText(f"Detected: {label}")
+        if hasattr(self, "_lens_profile_enable_chk"):
+            enabled = bool(lens_name)
+            self._lens_profile_enable_chk.setEnabled(enabled)
+            if not enabled:
+                self._lens_profile_enable_chk.setChecked(False)
+
+    def _build_slider_row(self, label: str, min_val: int, max_val: int, init: int, changed_cb, suffix: str = "", step: int = 1):
+        row = QWidget()
+        h = QHBoxLayout(row)
+        h.setContentsMargins(0, 0, 0, 0)
+        h.setSpacing(6)
+        lbl = QLabel(label)
+        lbl.setMinimumWidth(110)
+        slider = QSlider(Qt.Horizontal)
+        slider.setRange(min_val, max_val)
+        slider.setValue(init)
+        slider.setSingleStep(step)
+        spin = QDoubleSpinBox()
+        spin.setDecimals(2)
+        spin.setRange(min_val, max_val)
+        spin.setValue(init)
+        if suffix:
+            spin.setSuffix(suffix)
+
+        def on_slider(val):
+            spin.blockSignals(True)
+            spin.setValue(val)
+            spin.blockSignals(False)
+            changed_cb(val)
+
+        def on_spin(val):
+            slider.blockSignals(True)
+            slider.setValue(int(val))
+            slider.blockSignals(False)
+            changed_cb(val)
+
+        slider.valueChanged.connect(on_slider)
+        spin.valueChanged.connect(on_spin)
+        h.addWidget(lbl)
+        h.addWidget(slider, 1)
+        h.addWidget(spin, 0)
+        return row, slider, spin
+
+    # ---------- sections ----------
+    def _build_transform_section(self) -> CollapsibleSection:
+        transform = CollapsibleSection("Transform", self, start_collapsed=True)
+        tlay = transform.content_layout()
+
+        row, rot_slider, rot_spin = self._build_slider_row("Rotation", -45, 45, 0, lambda val: self._set_geom("rotate_deg", float(val)), "°", 1)
+        rot_spin.setRange(-180.0, 180.0)
+        rot_spin.setSingleStep(0.1)
+        rot_slider.setRange(-45, 45)
+        tlay.addWidget(row)
+
+        lock_chk = QCheckBox("Lock aspect ratio")
+        lock_chk.setChecked(True)
+        tlay.addWidget(lock_chk)
+
+        scale_row, scale_slider, scale_spin = self._build_slider_row("Scale", 10, 300, 100, lambda val: self._on_scale_changed(val, lock_chk.isChecked()))
+        scale_spin.setDecimals(1)
+        tlay.addWidget(scale_row)
+
+        self.scale_x_row, sx_slider, _ = self._build_slider_row("Width", 10, 300, 100, lambda val: self._set_geom("scale_x", float(val) / 100.0))
+        self.scale_y_row, sy_slider, _ = self._build_slider_row("Height", 10, 300, 100, lambda val: self._set_geom("scale_y", float(val) / 100.0))
+        self.scale_x_row.setVisible(False)
+        self.scale_y_row.setVisible(False)
+        tlay.addWidget(self.scale_x_row)
+        tlay.addWidget(self.scale_y_row)
+
+        lock_chk.toggled.connect(lambda checked: self._toggle_scale_lock(checked))
+
+        ox_row, _, _ = self._build_slider_row("Offset X", -100, 100, 0, lambda val: self._set_geom("offset_x", float(val) / 100.0))
+        oy_row, _, _ = self._build_slider_row("Offset Y", -100, 100, 0, lambda val: self._set_geom("offset_y", float(val) / 100.0))
+        tlay.addWidget(ox_row)
+        tlay.addWidget(oy_row)
+
+        flip_row = QWidget()
+        fh = QHBoxLayout(flip_row)
+        fh.setContentsMargins(0, 0, 0, 0)
+        fh.setSpacing(6)
+        fh.addWidget(QLabel("Flip"))
+        fh.addStretch(1)
+        flip_h = QToolButton()
+        flip_h.setText("Horizontal")
+        flip_h.setCheckable(True)
+        flip_v = QToolButton()
+        flip_v.setText("Vertical")
+        flip_v.setCheckable(True)
+        flip_h.toggled.connect(lambda checked: self._set_geom("flip_horizontal", checked))
+        flip_v.toggled.connect(lambda checked: self._set_geom("flip_vertical", checked))
+        fh.addWidget(flip_h)
+        fh.addWidget(flip_v)
+        tlay.addWidget(flip_row)
+
+        # Anchor & Reset card
+        anchor = CollapsibleSection("Anchor & Reset", self, start_collapsed=True)
+        alay = anchor.content_layout()
+        grid = QWidget()
+        grid_layout = QGridLayout(grid)
+        grid_layout.setContentsMargins(0, 0, 0, 0)
+        grid_layout.setSpacing(4)
+        anchor_positions = [
+            ("tl", 0, 0), ("tc", 0, 1), ("tr", 0, 2),
+            ("cl", 1, 0), ("cc", 1, 1), ("cr", 1, 2),
+            ("bl", 2, 0), ("bc", 2, 1), ("br", 2, 2),
+        ]
+        for key, r, c in anchor_positions:
+            btn = QToolButton()
+            btn.setText("")
+            btn.setCheckable(True)
+            btn.setAutoExclusive(True)
+            btn.setToolTip(key.upper())
+            btn.toggled.connect(lambda checked, k=key: checked and self._set_geom("anchor", k))
+            grid_layout.addWidget(btn, r, c)
+            if key == "cc":
+                btn.setChecked(True)
+        alay.addWidget(grid)
+
+        reset_btn = QPushButton("Reset Transform")
+        reset_btn.clicked.connect(self._reset_geom)
+        alay.addWidget(reset_btn)
+        # Stack sections vertically
+        wrapper = QWidget()
+        wlay = QVBoxLayout(wrapper)
+        wlay.setContentsMargins(0, 0, 0, 0)
+        wlay.setSpacing(6)
+        wlay.addWidget(transform)
+        wlay.addWidget(anchor)
+        return wrapper
+
+    def _on_scale_changed(self, val: float, locked: bool):
+        scale = float(val) / 100.0
+        g = self._geom()
+        g["scale_uniform"] = scale
+        if locked:
+            g["scale_x"] = scale
+            g["scale_y"] = scale
+        self._emit_render()
+
+    def _toggle_scale_lock(self, locked: bool):
+        self.scale_x_row.setVisible(not locked)
+        self.scale_y_row.setVisible(not locked)
+        if locked:
+            scale = self._geom().get("scale_uniform", 1.0)
+            self._geom()["scale_x"] = scale
+            self._geom()["scale_y"] = scale
+            self._emit_render()
+
+    def _build_perspective_section(self) -> CollapsibleSection:
+        persp = CollapsibleSection("Perspective", self, start_collapsed=True)
+        play = persp.content_layout()
+        for label, key, rng in [
+            ("Vertical", "vertical_persp", (-100, 100)),
+            ("Horizontal", "horizontal_persp", (-100, 100)),
+            ("Rotate X", "rotate_x_deg", (-45, 45)),
+            ("Rotate Y", "rotate_y_deg", (-45, 45)),
+        ]:
+            row, _, _ = self._build_slider_row(label, rng[0], rng[1], 0, lambda val, k=key: self._set_geom(k, float(val)), "°" if "Rotate" in label else "")
+            play.addWidget(row)
+        upright = CollapsibleSection("Upright", self, start_collapsed=True)
+        ulay = upright.content_layout()
+        btn_row = QWidget()
+        hb = QHBoxLayout(btn_row)
+        hb.setContentsMargins(0, 0, 0, 0)
+        hb.setSpacing(4)
+        upright_modes = ["off", "level", "vertical", "full", "guided"]
+        upright_group = QButtonGroup(self)
+        for mode in upright_modes:
+            btn = QToolButton()
+            btn.setText(mode.title())
+            btn.setCheckable(True)
+            btn.setAutoExclusive(True)
+            btn.toggled.connect(lambda checked, m=mode: checked and self._set_geom("upright_mode", m))
+            upright_group.addButton(btn)
+            hb.addWidget(btn)
+            if mode == "off":
+                btn.setChecked(True)
+        ulay.addWidget(btn_row)
+        ulay.addWidget(QLabel("Guided: draw 2–4 lines along vertical/horizontal edges."))
+        clear_btn = QPushButton("Clear Guides")
+        clear_btn.clicked.connect(lambda: self._set_geom("guided_lines", []))
+        ulay.addWidget(clear_btn)
+        wrapper = QWidget()
+        wlay = QVBoxLayout(wrapper)
+        wlay.setContentsMargins(0, 0, 0, 0)
+        wlay.setSpacing(6)
+        wlay.addWidget(persp)
+        wlay.addWidget(upright)
+        return wrapper
+
+    def _build_lens_section(self) -> CollapsibleSection:
+        profile = CollapsibleSection("Lens Profile", self, start_collapsed=True)
+        pl = profile.content_layout()
+        enable_chk = QCheckBox("Enable Lens Profile Corrections")
+        enable_chk.setChecked(self._geom_defaults.get("lens_profile_enabled", False))
+        enable_chk.toggled.connect(lambda checked: self._set_geom("lens_profile_enabled", checked))
+        pl.addWidget(enable_chk)
+        self.lens_profile_detected_label = QLabel(f"Detected: {self._geom_defaults.get('lens_profile_name', 'Unknown')}")
+        pl.addWidget(self.lens_profile_detected_label)
+        profile_amount_row, profile_slider, profile_spin = self._build_slider_row(
+            "Profile Amount", 0, 100, int(self._geom_defaults.get("lens_profile_amount", 1.0) * 100), lambda val: self._set_geom("lens_profile_amount", float(val) / 100.0)
+        )
+        profile_spin.setDecimals(0)
+        self._lens_profile_slider = profile_slider
+        self._lens_profile_spin = profile_spin
+        pl.addWidget(profile_amount_row)
+        self._lens_profile_enable_chk = enable_chk
+        manual = CollapsibleSection("Manual Lens Corrections", self, start_collapsed=True)
+        ml = manual.content_layout()
+        for label, key, rng in [
+            ("Distortion", "distortion", (-100, 100)),
+            ("Vignette Amount", "vignette_amount", (-100, 100)),
+            ("Vignette Midpoint", "vignette_midpoint", (0, 100)),
+            ("Defish Fisheye", "defish_amount", (0, 100)),
+        ]:
+            row, _, _ = self._build_slider_row(label, rng[0], rng[1], int(self._geom_defaults.get(key, 0)), lambda val, k=key: self._set_geom(k, float(val)))
+            ml.addWidget(row)
+        wrapper = QWidget()
+        wlay = QVBoxLayout(wrapper)
+        wlay.setContentsMargins(0, 0, 0, 0)
+        wlay.setSpacing(6)
+        wlay.addWidget(profile)
+        wlay.addWidget(manual)
+        return wrapper
+
+    def _build_crop_section(self) -> CollapsibleSection:
+        crop = CollapsibleSection("Crop", self, start_collapsed=True)
+        cl = crop.content_layout()
+        crop_chk = QCheckBox("Enable Crop")
+        crop_chk.setChecked(self._geom_defaults.get("crop_enabled", False))
+        crop_chk.toggled.connect(lambda checked: self._set_geom("crop_enabled", checked))
+        cl.addWidget(crop_chk)
+
+        aspect_row = QWidget()
+        hb = QHBoxLayout(aspect_row)
+        hb.setContentsMargins(0, 0, 0, 0)
+        hb.setSpacing(4)
+        hb.addWidget(QLabel("Aspect"))
+        aspect_modes = ["original", "free", "1:1", "4:5", "3:2", "16:9", "custom"]
+        aspect_group = QButtonGroup(self)
+        for mode in aspect_modes:
+            btn = QToolButton()
+            btn.setText(mode)
+            btn.setCheckable(True)
+            btn.setAutoExclusive(True)
+            btn.toggled.connect(lambda checked, m=mode: checked and self._set_geom("crop_aspect_mode", m))
+            aspect_group.addButton(btn)
+            hb.addWidget(btn)
+            if mode == "original":
+                btn.setChecked(True)
+        cl.addWidget(aspect_row)
+
+        reset_crop = QPushButton("Reset Crop")
+        reset_crop.clicked.connect(lambda: self._reset_crop())
+        rotate_aspect = QPushButton("Rotate Aspect")
+        rotate_aspect.clicked.connect(lambda: self._rotate_aspect())
+        btn_row = QWidget()
+        bhl = QHBoxLayout(btn_row)
+        bhl.setContentsMargins(0, 0, 0, 0)
+        bhl.setSpacing(6)
+        bhl.addWidget(reset_crop)
+        bhl.addWidget(rotate_aspect)
+        cl.addWidget(btn_row)
+        guides = CollapsibleSection("Guides & Safe Areas", self, start_collapsed=True)
+        gl = guides.content_layout()
+        guides_combo = QComboBox()
+        guides_combo.addItems(["none", "thirds", "golden", "diagonals", "center"])
+        guides_combo.currentTextChanged.connect(lambda text: self._set_geom("guides_mode", text))
+        gl.addWidget(QLabel("Overlay"))
+        gl.addWidget(guides_combo)
+        safe_chk = QCheckBox("Show Safe Areas")
+        safe_chk.setChecked(self._geom_defaults.get("show_safe_areas", False))
+        safe_chk.toggled.connect(lambda checked: self._set_geom("show_safe_areas", checked))
+        gl.addWidget(safe_chk)
+        wrapper = QWidget()
+        wlay = QVBoxLayout(wrapper)
+        wlay.setContentsMargins(0, 0, 0, 0)
+        wlay.setSpacing(6)
+        wlay.addWidget(crop)
+        wlay.addWidget(guides)
+        return wrapper
+
+    def _reset_crop(self):
+        g = self._geom()
+        g.update({
+            "crop_enabled": False,
+            "crop_x": 0.0,
+            "crop_y": 0.0,
+            "crop_w": 1.0,
+            "crop_h": 1.0,
+            "crop_aspect_mode": "original",
+        })
+        self._emit_render()
+
+    def _rotate_aspect(self):
+        g = self._geom()
+        g["crop_w"], g["crop_h"] = g.get("crop_h", 1.0), g.get("crop_w", 1.0)
+        self._emit_render()
+
+    def _build_warp_section(self) -> CollapsibleSection:
+        keystone = CollapsibleSection("Keystone & Volume", self, start_collapsed=True)
+        kl = keystone.content_layout()
+        for label, key in [
+            ("Top Keystone", "keystone_top"),
+            ("Bottom Keystone", "keystone_bottom"),
+            ("Volume Deformation", "volume_deform"),
+        ]:
+            row, _, _ = self._build_slider_row(label, -100, 100, 0, lambda val, k=key: self._set_geom(k, float(val)))
+            kl.addWidget(row)
+        mesh = CollapsibleSection("Mesh Warp (Basic)", self, start_collapsed=True)
+        ml = mesh.content_layout()
+        enable_chk = QCheckBox("Enable Mesh Warp")
+        enable_chk.setChecked(self._geom_defaults.get("mesh_enabled", False))
+        enable_chk.toggled.connect(lambda checked: self._set_geom("mesh_enabled", checked))
+        ml.addWidget(enable_chk)
+
+        rows_spin = QSpinBox()
+        rows_spin.setRange(2, 8)
+        rows_spin.setValue(int(self._geom_defaults.get("mesh_rows", 4)))
+        rows_spin.valueChanged.connect(lambda val: self._set_geom("mesh_rows", int(val)))
+        cols_spin = QSpinBox()
+        cols_spin.setRange(2, 8)
+        cols_spin.setValue(int(self._geom_defaults.get("mesh_cols", 4)))
+        cols_spin.valueChanged.connect(lambda val: self._set_geom("mesh_cols", int(val)))
+        mesh_row = QWidget()
+        mh = QHBoxLayout(mesh_row)
+        mh.setContentsMargins(0, 0, 0, 0)
+        mh.setSpacing(6)
+        mh.addWidget(QLabel("Rows"))
+        mh.addWidget(rows_spin)
+        mh.addWidget(QLabel("Columns"))
+        mh.addWidget(cols_spin)
+        ml.addWidget(mesh_row)
+
+        reset_mesh = QPushButton("Reset Mesh")
+        reset_mesh.clicked.connect(lambda: self._reset_mesh(rows_spin, cols_spin))
+        ml.addWidget(reset_mesh)
+        wrapper = QWidget()
+        wlay = QVBoxLayout(wrapper)
+        wlay.setContentsMargins(0, 0, 0, 0)
+        wlay.setSpacing(6)
+        wlay.addWidget(keystone)
+        wlay.addWidget(mesh)
+        return wrapper
+
+    def _reset_mesh(self, rows_spin: QSpinBox, cols_spin: QSpinBox):
+        rows_spin.setValue(4)
+        cols_spin.setValue(4)
+        g = self._geom()
+        g.update({
+            "mesh_enabled": False,
+            "mesh_rows": 4,
+            "mesh_cols": 4,
+        })
+        self._emit_render()
 
 
 class FXGroupWidget(BaseGroupWidget):
-    """GROUP 5 - FX stub."""
+    """GROUP 5 - FX / Output."""
 
     def __init__(self, mw: "MainWindow", parent=None):
         super().__init__(parent)
         self._mw = mw
-        page = QWidget()
-        v = QVBoxLayout(page)
-        v.addWidget(QLabel("Lens Filter tab coming soon..."))
-        v.addStretch(1)
-        self.add_tab(page, "Lens Filter")
+        self._sections: dict[str, CollapsibleSection] = {}
+        lens_page = QWidget()
+        lv = QVBoxLayout(lens_page)
+        lv.addWidget(QLabel("Lens Filter tab coming soon..."))
+        lv.addStretch(1)
+        self.add_tab(lens_page, "Lens Filter")
+
+        output_page = QWidget()
+        ov = QVBoxLayout(output_page)
+        output_section = CollapsibleSection("Output Transform", self, start_collapsed=False)
+        ol = output_section.content_layout()
+        ol.addWidget(QLabel("Rendering Look"))
+        self.output_combo = QComboBox()
+        self.output_combo.addItems(["Standard", "Filmic"])
+        current_mode = str(self._mw._current_params.get("output_transform", "standard")).lower()
+        self.output_combo.setCurrentIndex(1 if current_mode == "filmic" else 0)
+        self.output_combo.currentIndexChanged.connect(self._on_output_transform_changed)
+        ol.addWidget(self.output_combo)
+        ov.addWidget(output_section)
+        ov.addStretch(1)
+        self.add_tab(output_page, "Output")
+
+    def _emit_render(self):
+        if getattr(self._mw, "_preview_base_linear", None) is None:
+            return
+        try:
+            if hasattr(self._mw, "_on_edit_params_changed"):
+                self._mw._on_edit_params_changed()
+            elif hasattr(self._mw, "_schedule_render"):
+                self._mw._schedule_render()
+        except Exception:
+            pass
+
+    def _on_output_transform_changed(self, index: int):
+        mode = "filmic" if index == 1 else "standard"
+        self._mw._current_params["output_transform"] = mode
+        self._emit_render()
+
+    def expand_section(self, name: str):
+        # Placeholder: no collapsible sections yet.
+        return
+
+    def show_only_section(self, name: str):
+        # Placeholder: no collapsible sections yet.
+        return
 
 
 __all__ = [

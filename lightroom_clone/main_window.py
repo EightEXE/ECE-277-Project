@@ -1,9 +1,15 @@
+from __future__ import annotations
 import base64
 import copy
 import os
 import sys
 import json
+import cv2
+import time
+import tempfile
+from collections import deque
 from dataclasses import dataclass, field
+from enum import Enum
 from datetime import datetime
 from io import BytesIO
 from typing import Callable, Iterable, NamedTuple
@@ -72,6 +78,7 @@ from PySide6.QtGui import QPixmap, QIcon, QFontMetrics, QColor, QImage, QPainter
 from PIL import Image, ExifTags, ImageFilter
 
 from .adjustments_panel import AdjustmentsPanel
+from .groups import LightGroupWidget, ColorGroupWidget, ToneGroupWidget, FXGroupWidget
 from .constants import (
     IMAGE_EXTENSIONS,
     LRC_VERSION,
@@ -90,6 +97,8 @@ from .color_tools import (
 )
 from .utils import (
     abspath_from_base as _abspath_from_base,
+    load_image_full_linear as _load_image_full_linear,
+    load_image_preview_linear as _load_image_preview_linear,
     load_linear_image as _load_linear_image,
     load_qimage_any as _load_qimage_any,
     qimage_from_linear,
@@ -132,6 +141,11 @@ def _resource_path(*parts: str) -> str:
     if bundle_root is None:
         bundle_root = os.path.normpath(os.path.join(os.path.dirname(__file__), ".."))
     return os.path.normpath(os.path.join(bundle_root, *parts))
+
+
+class OutputTransformMode(Enum):
+    STANDARD = "standard"
+    FILMIC = "filmic"
 
 
 @dataclass
@@ -191,6 +205,59 @@ class EditParams:
     normal_intensity: float = 1.0
     normal_specular: float = 0.0
     normal_diffuse: float = 1.0
+    view_exposure_bias: float = 0.0
+    output_transform: OutputTransformMode = OutputTransformMode.STANDARD
+    # geometry placeholder; populated by _dict_to_geometry_params
+    geometry: "GeometryParams" | None = None
+
+
+@dataclass
+class GeometryParams:
+    # Transform
+    rotate_deg: float = 0.0
+    scale_uniform: float = 1.0
+    scale_x: float = 1.0
+    scale_y: float = 1.0
+    offset_x: float = 0.0
+    offset_y: float = 0.0
+    flip_horizontal: bool = False
+    flip_vertical: bool = False
+    anchor: str = "center"
+
+    # Perspective
+    vertical_persp: float = 0.0
+    horizontal_persp: float = 0.0
+    rotate_x_deg: float = 0.0
+    rotate_y_deg: float = 0.0
+    upright_mode: str = "off"
+    guided_lines: list = field(default_factory=list)
+
+    # Lens
+    lens_profile_enabled: bool = False
+    lens_profile_amount: float = 1.0
+    lens_profile_name: str = ""
+    distortion: float = 0.0
+    vignette_amount: float = 0.0
+    vignette_midpoint: float = 50.0
+    defish_amount: float = 0.0
+
+    # Crop & Guides
+    crop_enabled: bool = False
+    crop_x: float = 0.0
+    crop_y: float = 0.0
+    crop_w: float = 1.0
+    crop_h: float = 1.0
+    crop_aspect_mode: str = "original"
+    guides_mode: str = "none"
+    show_safe_areas: bool = False
+
+    # Warp
+    keystone_top: float = 0.0
+    keystone_bottom: float = 0.0
+    volume_deform: float = 0.0
+    mesh_enabled: bool = False
+    mesh_rows: int = 4
+    mesh_cols: int = 4
 
 
 class TileKey(NamedTuple):
@@ -201,9 +268,28 @@ class TileKey(NamedTuple):
 
 # --- Acceleration toggles ---
 _USE_NUMBA_BASIC = _HAVE_NUMBA and os.environ.get("GS_USE_NUMBA", "1") == "1"
-_USE_CUDA_BASIC = _CUDA_AVAILABLE and os.environ.get("GS_USE_CUDA", "0") == "1"
+# Default to CUDA when available; users can opt-out with GS_USE_CUDA=0
+_USE_CUDA_BASIC = _CUDA_AVAILABLE and os.environ.get("GS_USE_CUDA", "1") == "1"
 _USE_NUMBA_SHARPEN = _HAVE_NUMBA and os.environ.get("GS_USE_NUMBA_SHARPEN", "1") == "1"
-_USE_CUDA_SHARPEN = _CUDA_AVAILABLE and os.environ.get("GS_USE_CUDA_SHARPEN", "0") == "1"
+_USE_CUDA_SHARPEN = _CUDA_AVAILABLE and os.environ.get("GS_USE_CUDA_SHARPEN", "1") == "1"
+
+
+def get_cuda_basic_enabled() -> bool:
+    return _USE_CUDA_BASIC
+
+
+def set_cuda_basic_enabled(enabled: bool):
+    global _USE_CUDA_BASIC
+    _USE_CUDA_BASIC = bool(enabled and _CUDA_AVAILABLE)
+
+
+def get_cuda_sharpen_enabled() -> bool:
+    return _USE_CUDA_SHARPEN
+
+
+def set_cuda_sharpen_enabled(enabled: bool):
+    global _USE_CUDA_SHARPEN
+    _USE_CUDA_SHARPEN = bool(enabled and _CUDA_AVAILABLE)
 
 
 def _f32(arr: np.ndarray) -> np.ndarray:
@@ -594,6 +680,16 @@ def _decode_normal_map_entry(entry) -> np.ndarray | None:
         return None
 
 
+def _coerce_output_transform(val) -> OutputTransformMode:
+    if isinstance(val, OutputTransformMode):
+        return val
+    if isinstance(val, str):
+        lower = val.lower()
+        if lower == OutputTransformMode.FILMIC.value:
+            return OutputTransformMode.FILMIC
+    return OutputTransformMode.STANDARD
+
+
 def _dict_to_edit_params(params: dict) -> EditParams:
     """Normalize UI-friendly dict parameters into an EditParams dataclass."""
     params = params or {}
@@ -602,9 +698,13 @@ def _dict_to_edit_params(params: dict) -> EditParams:
     def center(val: float, scale: float = 1.0) -> float:
         return (float(val) - 128.0) / 128.0 * scale
 
+    def _contrast_scale(raw_val: float) -> float:
+        """Map 0-255 UI value to a gentle 0.5-1.5 contrast multiplier."""
+        return 1.0 + ((raw_val - 128.0) / 128.0) * 0.5
+
     return EditParams(
         exposure=center(get("exposure", 128), 2.0),
-        contrast=float(get("contrast", 128)) / 128.0,
+        contrast=_contrast_scale(float(get("contrast", 128))),
         highlights=center(get("highlights", 128), 0.6),
         shadows=center(get("shadows", 128), 0.6),
         whites=center(get("whites", 128), 0.8),
@@ -655,6 +755,57 @@ def _dict_to_edit_params(params: dict) -> EditParams:
         normal_intensity=float(get("normal_intensity", 100)) / 100.0,
         normal_specular=float(get("normal_specular", 0)) / 100.0,
         normal_diffuse=float(get("normal_diffuse", 100)) / 100.0,
+        view_exposure_bias=float(get("view_exposure_bias", 0.0)),
+        output_transform=_coerce_output_transform(get("output_transform", OutputTransformMode.STANDARD.value)),
+        geometry=_dict_to_geometry_params(get("geometry")),
+    )
+
+
+def _dict_to_geometry_params(params: dict | None) -> GeometryParams:
+    p = params or {}
+    amt = p.get("lens_profile_amount", p.get("profile_amount", 100))
+    if amt is None:
+        amt = 0
+    amt = float(amt)
+    if amt > 1.5:  # assume percent
+        amt /= 100.0
+    return GeometryParams(
+        rotate_deg=float(p.get("rotate_deg", 0.0)),
+        scale_uniform=float(p.get("scale_uniform", 1.0)),
+        scale_x=float(p.get("scale_x", 1.0)),
+        scale_y=float(p.get("scale_y", 1.0)),
+        offset_x=float(p.get("offset_x", 0.0)),
+        offset_y=float(p.get("offset_y", 0.0)),
+        flip_horizontal=bool(p.get("flip_horizontal", False)),
+        flip_vertical=bool(p.get("flip_vertical", False)),
+        anchor=p.get("anchor", "center"),
+        vertical_persp=float(p.get("vertical_persp", 0.0)),
+        horizontal_persp=float(p.get("horizontal_persp", 0.0)),
+        rotate_x_deg=float(p.get("rotate_x_deg", 0.0)),
+        rotate_y_deg=float(p.get("rotate_y_deg", 0.0)),
+        upright_mode=p.get("upright_mode", "off"),
+        guided_lines=list(p.get("guided_lines", [])),
+        lens_profile_enabled=bool(p.get("lens_profile_enabled", p.get("use_lens_profile", False))),
+        lens_profile_amount=max(0.0, min(1.0, amt)),
+        lens_profile_name=p.get("lens_profile_name", ""),
+        distortion=float(p.get("distortion", 0.0)),
+        vignette_amount=float(p.get("vignette_amount", 0.0)),
+        vignette_midpoint=float(p.get("vignette_midpoint", 50.0)),
+        defish_amount=float(p.get("defish_amount", 0.0)),
+        crop_enabled=bool(p.get("crop_enabled", False)),
+        crop_x=float(p.get("crop_x", 0.0)),
+        crop_y=float(p.get("crop_y", 0.0)),
+        crop_w=float(p.get("crop_w", 1.0)),
+        crop_h=float(p.get("crop_h", 1.0)),
+        crop_aspect_mode=p.get("crop_aspect_mode", "original"),
+        guides_mode=p.get("guides_mode", "none"),
+        show_safe_areas=bool(p.get("show_safe_areas", False)),
+        keystone_top=float(p.get("keystone_top", 0.0)),
+        keystone_bottom=float(p.get("keystone_bottom", 0.0)),
+        volume_deform=float(p.get("volume_deform", 0.0)),
+        mesh_enabled=bool(p.get("mesh_enabled", False)),
+        mesh_rows=int(p.get("mesh_rows", 4)),
+        mesh_cols=int(p.get("mesh_cols", 4)),
     )
 
 
@@ -830,8 +981,8 @@ def apply_tone_curve(image: np.ndarray, params: EditParams, quality: str) -> np.
     return rgb
 
 
-def apply_basic_adjustments(image: np.ndarray, params: EditParams, quality: str) -> np.ndarray:
-    accel = _apply_basic_adjustments_accel(image, params)
+def apply_basic_adjustments(image: np.ndarray, params: EditParams, quality: str, allow_cuda: bool = True) -> np.ndarray:
+    accel = _apply_basic_adjustments_accel(image, params, allow_cuda=allow_cuda)
     if accel is not None:
         return accel
 
@@ -1040,8 +1191,8 @@ def apply_noise_reduction(image: np.ndarray, params: EditParams) -> np.ndarray:
     return image
 
 
-def apply_sharpening(image: np.ndarray, params: EditParams) -> np.ndarray:
-    accel = _apply_sharpening_accel(image)
+def apply_sharpening(image: np.ndarray, params: EditParams, allow_cuda: bool = True) -> np.ndarray:
+    accel = _apply_sharpening_accel(image, allow_cuda=allow_cuda)
     if accel is not None:
         return accel
 
@@ -1053,45 +1204,456 @@ def apply_sharpening(image: np.ndarray, params: EditParams) -> np.ndarray:
     return to_linear(sharpened_arr)
 
 
-def apply_pipeline(image: np.ndarray, params: dict | EditParams, quality: str = "final") -> np.ndarray:
-    """
-    Apply all edits (exposure, contrast, curves, WB, etc.) to `image`.
+@njit(cache=True, fastmath=True)
+def _njit_exposure_contrast(rgb: np.ndarray, exposure: float, contrast: float) -> np.ndarray:
+    h, w, c = rgb.shape
+    out = np.empty_like(rgb)
+    exp_mul = 2.0 ** exposure
+    for y in range(h):
+        for x in range(w):
+            for k in range(c):
+                val = rgb[y, x, k] * exp_mul
+                val = (val - 0.5) * contrast + 0.5
+                if val < 0.0:
+                    val = 0.0
+                elif val > 1.0:
+                    val = 1.0
+                out[y, x, k] = val
+    return out
 
-    quality: "preview" runs a cheaper stack; "final" enables heavier steps.
+
+@njit(cache=True, fastmath=True)
+def _njit_white_balance(rgb: np.ndarray, r_gain: float, g_gain: float, b_gain: float) -> np.ndarray:
+    h, w, _ = rgb.shape
+    out = np.empty_like(rgb)
+    for y in range(h):
+        for x in range(w):
+            r = rgb[y, x, 0] * r_gain
+            g = rgb[y, x, 1] * g_gain
+            b = rgb[y, x, 2] * b_gain
+            if r < 0.0:
+                r = 0.0
+            if g < 0.0:
+                g = 0.0
+            if b < 0.0:
+                b = 0.0
+            if r > 1.0:
+                r = 1.0
+            if g > 1.0:
+                g = 1.0
+            if b > 1.0:
+                b = 1.0
+            out[y, x, 0] = r
+            out[y, x, 1] = g
+            out[y, x, 2] = b
+    return out
+
+
+@njit(cache=True, fastmath=True)
+def _njit_lut_curve(rgb: np.ndarray, lut: np.ndarray) -> np.ndarray:
+    h, w, c = rgb.shape
+    out = np.empty_like(rgb)
+    for y in range(h):
+        for x in range(w):
+            for k in range(c):
+                val = rgb[y, x, k]
+                idx = int(val * 255.0)
+                if idx < 0:
+                    idx = 0
+                elif idx > 255:
+                    idx = 255
+                out[y, x, k] = lut[idx]
+    return out
+
+
+@cuda.jit
+def _cuda_box_blur(src, dst, ksize):
+    y, x = cuda.grid(2)
+    if y >= src.shape[0] or x >= src.shape[1]:
+        return
+    half = ksize // 2
+    acc0 = 0.0
+    acc1 = 0.0
+    acc2 = 0.0
+    count = 0
+    for dy in range(-half, half + 1):
+        yy = y + dy
+        if yy < 0 or yy >= src.shape[0]:
+            continue
+        for dx in range(-half, half + 1):
+            xx = x + dx
+            if xx < 0 or xx >= src.shape[1]:
+                continue
+            acc0 += src[yy, xx, 0]
+            acc1 += src[yy, xx, 1]
+            acc2 += src[yy, xx, 2]
+            count += 1
+    if count > 0:
+        dst[y, x, 0] = acc0 / count
+        dst[y, x, 1] = acc1 / count
+        dst[y, x, 2] = acc2 / count
+
+
+def _apply_affine_pillow(img: np.ndarray, rotate_deg: float, scale_x: float, scale_y: float, offset_x: float, offset_y: float) -> np.ndarray:
+    """Lightweight affine using Pillow; expects linear float 0..1 array."""
+    if img is None:
+        return img
+    h, w = img.shape[:2]
+    if h == 0 or w == 0:
+        return img
+    srgb = to_srgb(np.clip(img, 0.0, 1.0))
+    u8 = (srgb * 255.0).round().astype(np.uint8)
+    pil_img = Image.fromarray(u8, mode="RGB")
+
+    # Scale
+    if abs(scale_x - 1.0) > 1e-3 or abs(scale_y - 1.0) > 1e-3:
+        new_w = max(1, int(round(w * scale_x)))
+        new_h = max(1, int(round(h * scale_y)))
+        pil_img = pil_img.resize((new_w, new_h), resample=Image.BICUBIC)
+        canvas = Image.new("RGB", (w, h), (0, 0, 0))
+        ox = int(round((w - new_w) / 2))
+        oy = int(round((h - new_h) / 2))
+        canvas.paste(pil_img, (ox, oy))
+        pil_img = canvas
+
+    # Offset (normalized -1..1 to pixels)
+    dx = int(round(offset_x * w * 0.5))
+    dy = int(round(offset_y * h * 0.5))
+    if dx or dy:
+        canvas = Image.new("RGB", (w, h), (0, 0, 0))
+        canvas.paste(pil_img, (dx, dy))
+        pil_img = canvas
+
+    # Rotation around center
+    if abs(rotate_deg) > 1e-3:
+        pil_img = pil_img.rotate(rotate_deg, resample=Image.BICUBIC, expand=False, center=(w / 2, h / 2), fillcolor=(0, 0, 0))
+
+    out = np.asarray(pil_img, dtype=np.float32) / 255.0
+    return to_linear(out)
+
+
+def _bilinear_sample(img: np.ndarray, x: np.ndarray, y: np.ndarray) -> np.ndarray:
+    h, w = img.shape[:2]
+    x0 = np.floor(x).astype(np.int32)
+    x1 = np.clip(x0 + 1, 0, w - 1)
+    y0 = np.floor(y).astype(np.int32)
+    y1 = np.clip(y0 + 1, 0, h - 1)
+    x0 = np.clip(x0, 0, w - 1)
+    y0 = np.clip(y0, 0, h - 1)
+
+    Ia = img[y0, x0]
+    Ib = img[y1, x0]
+    Ic = img[y0, x1]
+    Id = img[y1, x1]
+
+    wa = (x1 - x) * (y1 - y)
+    wb = (x1 - x) * (y - y0)
+    wc = (x - x0) * (y1 - y)
+    wd = (x - x0) * (y - y0)
+
+    out = (
+        Ia * wa[..., None]
+        + Ib * wb[..., None]
+        + Ic * wc[..., None]
+        + Id * wd[..., None]
+    )
+    return out
+
+
+def apply_lens_profile(image: np.ndarray, geom: GeometryParams) -> np.ndarray:
+    if image is None:
+        return image
+    amount = max(0.0, min(1.0, float(getattr(geom, "lens_profile_amount", 0.0) or 0.0)))
+    if not getattr(geom, "lens_profile_enabled", False) or amount <= 1e-4:
+        return image
+
+    img = np.ascontiguousarray(image, dtype=np.float32)
+    h, w = img.shape[:2]
+    if h == 0 or w == 0:
+        return img
+
+    yy, xx = np.meshgrid(np.linspace(-1.0, 1.0, h), np.linspace(-1.0, 1.0, w), indexing="ij")
+    r = np.sqrt(xx * xx + yy * yy)
+
+    # Radial distortion correction (k1)
+    k1 = -0.15 * amount
+    scale = 1.0 + k1 * (r ** 2)
+    x_corr = xx * scale
+    y_corr = yy * scale
+
+    # Map back to pixel coords
+    x_pix = (x_corr + 1.0) * 0.5 * (w - 1)
+    y_pix = (y_corr + 1.0) * 0.5 * (h - 1)
+    x_pix = np.clip(x_pix, 0, w - 1)
+    y_pix = np.clip(y_pix, 0, h - 1)
+
+    corrected = _bilinear_sample(img, x_pix, y_pix)
+
+    # Vignette correction
+    r_norm = np.clip(r / np.sqrt(2.0), 0.0, 1.0)
+    vig_strength = 0.4 * amount
+    gain = 1.0 + vig_strength * (1.0 - (r_norm ** 2))
+    corrected = np.clip(corrected * gain[..., None], 0.0, 1.0)
+
+    # Blend with original
+    out = img * (1.0 - amount) + corrected * amount
+    return np.clip(out, 0.0, 1.0)
+
+
+def _apply_crop(img: np.ndarray, geom: GeometryParams) -> np.ndarray:
+    if img is None or not geom.crop_enabled:
+        return img
+    h, w = img.shape[:2]
+    if w == 0 or h == 0:
+        return img
+    x0 = int(round(geom.crop_x * w))
+    y0 = int(round(geom.crop_y * h))
+    cw = int(round(geom.crop_w * w))
+    ch = int(round(geom.crop_h * h))
+    x1 = max(0, min(w, x0 + cw))
+    y1 = max(0, min(h, y0 + ch))
+    x0 = max(0, min(w, x0))
+    y0 = max(0, min(h, y0))
+    if x1 <= x0 or y1 <= y0:
+        return img
+    return img[y0:y1, x0:x1, ...]
+
+
+def apply_geometry(image: np.ndarray, params: EditParams, quality: str, allow_cuda: bool = True) -> np.ndarray:
+    """Apply geometry before tone/color; lightweight approximation to keep pipeline stable."""
+    geom = params.geometry or GeometryParams()
+    # If geometry is effectively neutral, skip to avoid tile artifacts.
+    if _geometry_is_identity(geom):
+        return image
+
+    img = image
+
+    # Lens profile first
+    img = apply_lens_profile(img, geom)
+
+    # Flips
+    if geom.flip_horizontal and img is not None:
+        img = np.ascontiguousarray(img[:, ::-1, :])
+    if geom.flip_vertical and img is not None:
+        img = np.ascontiguousarray(img[::-1, :, :])
+
+    # Affine (rotate/scale/offset)
+    if img is not None:
+        img = _apply_affine_pillow(
+            img,
+            geom.rotate_deg,
+            geom.scale_x if abs(geom.scale_uniform - 1.0) < 1e-3 else geom.scale_uniform,
+            geom.scale_y if abs(geom.scale_uniform - 1.0) < 1e-3 else geom.scale_uniform,
+            geom.offset_x,
+            geom.offset_y,
+        )
+
+    # TODO: Perspective / Upright / Keystone / Lens / Warp (placeholder no-ops for now)
+
+    # Avoid cropping for now to keep tile sizes stable
+    return img
+
+
+def _geometry_is_identity(geom) -> bool:
+    if geom is None:
+        return True
+    if isinstance(geom, dict):
+        geom = _dict_to_geometry_params(geom)
+    return (
+        abs(geom.rotate_deg) < 1e-3
+        and abs(geom.scale_uniform - 1.0) < 1e-3
+        and abs(geom.scale_x - 1.0) < 1e-3
+        and abs(geom.scale_y - 1.0) < 1e-3
+        and abs(geom.offset_x) < 1e-3
+        and abs(geom.offset_y) < 1e-3
+        and not geom.flip_horizontal
+        and not geom.flip_vertical
+        and abs(geom.vertical_persp) < 1e-3
+        and abs(geom.horizontal_persp) < 1e-3
+        and abs(geom.rotate_x_deg) < 1e-3
+        and abs(geom.rotate_y_deg) < 1e-3
+        and abs(geom.distortion) < 1e-3
+        and abs(geom.vignette_amount) < 1e-3
+        and abs(geom.defish_amount) < 1e-3
+        and abs(geom.keystone_top) < 1e-3
+        and abs(geom.keystone_bottom) < 1e-3
+        and abs(geom.volume_deform) < 1e-3
+        and not geom.mesh_enabled
+        and not geom.crop_enabled
+    )
+
+
+def _apply_geometry_opencv(img: np.ndarray, geom: GeometryParams) -> np.ndarray:
+    """Fast affine using OpenCV to avoid per-pixel loops."""
+    if img is None:
+        return img
+    h, w = img.shape[:2]
+    if h == 0 or w == 0:
+        return img
+    center = (w * 0.5, h * 0.5)
+    scale = geom.scale_uniform if abs(geom.scale_uniform - 1.0) > 1e-3 else 1.0
+    M = cv2.getRotationMatrix2D(center, geom.rotate_deg, scale)
+    M[0, 2] += geom.offset_x * w * 0.5
+    M[1, 2] += geom.offset_y * h * 0.5
+    flags = cv2.INTER_LINEAR
+    img = cv2.warpAffine(img, M, (w, h), flags=flags, borderMode=cv2.BORDER_REFLECT)
+    if geom.flip_horizontal:
+        img = cv2.flip(img, 1)
+    if geom.flip_vertical:
+        img = cv2.flip(img, 0)
+    return img
+
+
+def apply_filmic_tonemap(img_lin: np.ndarray) -> np.ndarray:
+    """Placeholder kept for backward compatibility; replaced by Hable curve below."""
+    return _hable_tonemap(np.maximum(img_lin, 0.0))
+
+
+def _hable_tonemap(x: np.ndarray) -> np.ndarray:
     """
+    Uncharted 2 / Hable filmic curve, applied in linear space.
+    x: linear RGB, float32, can be >1.0
+    returns: tonemapped RGB (still linear), not yet sRGB encoded.
+    """
+    A = 0.15
+    B = 0.50
+    C = 0.10
+    D = 0.20
+    E = 0.02
+    F = 0.30
+    W = 11.2  # white point
+
+    x2 = x * x  # noqa: F841 - kept for clarity with supplied reference
+    numerator = x * (A * x + C * B) + D * E
+    denominator = x * (A * x + B) + D * F
+    y = numerator / (denominator + 1e-8) - E / F
+
+    xw = W
+    numerator_w = xw * (A * xw + C * B) + D * E
+    denominator_w = xw * (A * xw + B) + D * F
+    y_w = numerator_w / (denominator_w + 1e-8) - E / F
+    white_scale = 1.0 / max(y_w, 1e-6)
+
+    y *= white_scale
+    return y
+
+
+def apply_filmic_tonemap(img_lin: np.ndarray, exposure_bias: float = 0.0) -> np.ndarray:
+    """
+    Full filmic output transform in linear space.
+
+    img_lin: float32 linear sRGB, [0, +∞)
+    exposure_bias: additional EV offset (0 = neutral, +1 = +1 stop, etc.)
+    """
+    if exposure_bias != 0.0:
+        img_lin = img_lin * (2.0 ** exposure_bias)
+
+    filmic = _hable_tonemap(np.maximum(img_lin, 0.0))
+    filmic = np.clip(filmic, 0.0, 1.0)
+    return filmic
+
+
+def apply_output_transform(img_lin: np.ndarray, mode: OutputTransformMode, view_exposure_bias: float = 0.0) -> np.ndarray:
+    if mode == OutputTransformMode.FILMIC:
+        return apply_filmic_tonemap(img_lin, exposure_bias=view_exposure_bias)
+    return np.clip(img_lin, 0.0, 1.0)
+
+
+def apply_pipeline_cpu(image: np.ndarray, params: dict | EditParams, quality: str = "final") -> np.ndarray:
     if image is None:
         return None
-
     edit_params = params if isinstance(params, EditParams) else _dict_to_edit_params(params or {})
+    geom = edit_params.geometry or GeometryParams()
     rgb = np.asarray(image, dtype=np.float32).copy()
     rgb = np.clip(rgb, 0.0, 1.0)
 
-    rgb = apply_white_balance(rgb, edit_params, quality)
-    rgb = apply_basic_adjustments(rgb, edit_params, quality)
+    # White balance
+    rgb = _njit_white_balance(rgb, 1.0 + edit_params.temperature, 1.0, 1.0 + edit_params.tint)
+
+    # Exposure first (pure linear gain), then contrast
+    rgb = _njit_exposure_contrast(rgb, edit_params.exposure, 1.0)
+    rgb = _njit_exposure_contrast(rgb, 0.0, edit_params.contrast)
+
+    # Tone ops (placeholder LUT)
+    lut = np.linspace(0.0, 1.0, 256, dtype=np.float32)
+    rgb = _njit_lut_curve(rgb, lut)
+
+    # Levels / curves / tone mapping
     rgb = apply_tone_curve(rgb, edit_params, quality)
+
+    # Color pipeline
     rgb = apply_channel_mixer(rgb, edit_params, quality)
     rgb = apply_gradient_map(rgb, edit_params, quality)
     rgb = apply_split_toning(rgb, edit_params, quality)
     rgb = apply_color_adjustments(rgb, edit_params, quality)
     rgb = apply_normal_relighting(rgb, edit_params, quality)
 
+    # Optics / geometry
+    rgb = apply_lens_profile(rgb, geom)
+    rgb = _apply_geometry_opencv(rgb, geom)
+
+    # Detail
     if quality == "final":
         rgb = apply_noise_reduction(rgb, edit_params)
-        rgb = apply_sharpening(rgb, edit_params)
+        rgb = apply_sharpening(rgb, edit_params, allow_cuda=False)
 
+    # Output transform (last nonlinear step before sRGB encoding)
+    rgb = apply_output_transform(rgb, edit_params.output_transform, edit_params.view_exposure_bias)
     return np.clip(rgb, 0.0, 1.0)
 
 
-def _apply_basic_adjustments_accel(image: np.ndarray, params: EditParams) -> np.ndarray | None:
+def apply_pipeline_cuda(image: np.ndarray, params: dict | EditParams, quality: str = "final") -> np.ndarray:
+    """GPU-heavy path: upload once, run heavy blur, then finish on CPU."""
+    if image is None:
+        return None
+    edit_params = params if isinstance(params, EditParams) else _dict_to_edit_params(params or {})
+    rgb = np.clip(np.asarray(image, dtype=np.float32), 0.0, 1.0)
+    d_in = cuda.to_device(rgb)
+    d_out = cuda.device_array_like(d_in)
+    threads = (16, 16)
+    blocks = ((rgb.shape[1] + threads[0] - 1) // threads[0],
+              (rgb.shape[0] + threads[1] - 1) // threads[1])
+    _cuda_box_blur[blocks, threads](d_in, d_out, 9)
+    rgb_blurred = d_out.copy_to_host()
+    # Finish with CPU pipeline for color/tone
+    return apply_pipeline_cpu(rgb_blurred, edit_params, quality)
+
+
+def apply_pipeline(image: np.ndarray, params: dict | EditParams, quality: str = "final") -> np.ndarray:
+    use_cuda = False
+    if isinstance(params, EditParams):
+        use_cuda = getattr(params, "use_cuda", False)
+    elif isinstance(params, dict):
+        use_cuda = params.get("use_cuda", False)
+    if use_cuda and cuda.is_available():
+        return apply_pipeline_cuda(image, params, quality)
+    return apply_pipeline_cpu(image, params, quality)
+
+
+def _apply_basic_adjustments_accel(image: np.ndarray, params: EditParams, allow_cuda: bool = True) -> np.ndarray | None:
     """Choose the fastest available backend (CUDA > numba CPU) for the heavy basic stage."""
     img = _f32(image)
-    if _USE_CUDA_BASIC:
+    if allow_cuda and _USE_CUDA_BASIC:
         try:
             h, w, _ = img.shape
+            # Pad tiny tiles so the CUDA grid has enough work to occupy SMs.
+            min_dim = 256
+            pad_h = max(0, min_dim - h)
+            pad_w = max(0, min_dim - w)
+            if pad_h > 0 or pad_w > 0:
+                img_padded = np.pad(img, ((0, pad_h), (0, pad_w), (0, 0)), mode="edge")
+            else:
+                img_padded = img
+
+            ph, pw, _ = img_padded.shape
             threads = (16, 16)
-            blocks = ((w + threads[0] - 1) // threads[0], (h + threads[1] - 1) // threads[1])
-            d_in = cuda.to_device(img)
-            d_out = cuda.device_array_like(img)
+            blocks = ((pw + threads[0] - 1) // threads[0], (ph + threads[1] - 1) // threads[1])
+            # For tiny previews the grid can under-utilize the GPU; step down block size aggressively to spawn more blocks.
+            if blocks[0] * blocks[1] < 256:
+                threads = (8, 8)
+                blocks = ((pw + threads[0] - 1) // threads[0], (ph + threads[1] - 1) // threads[1])
+            d_in = cuda.to_device(img_padded)
+            d_out = cuda.device_array_like(img_padded)
             _basic_cuda_kernel[blocks, threads](
                 d_in, d_out,
                 params.temperature, params.tint,
@@ -1099,7 +1661,10 @@ def _apply_basic_adjustments_accel(image: np.ndarray, params: EditParams) -> np.
                 params.highlights, params.shadows, params.whites, params.blacks,
                 params.saturation,
             )
-            return d_out.copy_to_host()
+            out = d_out.copy_to_host()
+            if pad_h > 0 or pad_w > 0:
+                out = out[:h, :w, :]
+            return out
         except Exception as exc:  # pragma: no cover - runtime safeguard
             print("[Accel] CUDA basic stage failed, falling back to CPU:", exc)
 
@@ -1118,20 +1683,31 @@ def _apply_basic_adjustments_accel(image: np.ndarray, params: EditParams) -> np.
     return None
 
 
-def _apply_sharpening_accel(image: np.ndarray) -> np.ndarray | None:
+def _apply_sharpening_accel(image: np.ndarray, allow_cuda: bool = True) -> np.ndarray | None:
     """Sharpen via CUDA or numba if enabled; otherwise fall back to PIL."""
     img = _f32(np.clip(image, 0.0, 1.0))
     amount = 0.8  # approximates 80% unsharp mask strength
 
-    if _USE_CUDA_SHARPEN:
+    if allow_cuda and _USE_CUDA_SHARPEN:
         try:
             h, w, _ = img.shape
+            min_dim = 256
+            pad_h = max(0, min_dim - h)
+            pad_w = max(0, min_dim - w)
+            if pad_h > 0 or pad_w > 0:
+                img_padded = np.pad(img, ((0, pad_h), (0, pad_w), (0, 0)), mode="edge")
+            else:
+                img_padded = img
+            ph, pw, _ = img_padded.shape
             threads = (16, 16)
-            blocks = ((w + threads[0] - 1) // threads[0], (h + threads[1] - 1) // threads[1])
-            d_in = cuda.to_device(img)
-            d_out = cuda.device_array_like(img)
+            blocks = ((pw + threads[0] - 1) // threads[0], (ph + threads[1] - 1) // threads[1])
+            d_in = cuda.to_device(img_padded)
+            d_out = cuda.device_array_like(img_padded)
             _sharpen_cuda_kernel[blocks, threads](d_in, d_out, amount)
-            return d_out.copy_to_host()
+            out = d_out.copy_to_host()
+            if pad_h > 0 or pad_w > 0:
+                out = out[:h, :w, :]
+            return out
         except Exception as exc:  # pragma: no cover - runtime safeguard
             print("[Accel] CUDA sharpening failed, falling back:", exc)
 
@@ -1161,6 +1737,12 @@ class _FullRenderWorker(QRunnable):
     def run(self):
         try:
             result = apply_pipeline(self._image, self._params, quality="final")
+            if (
+                result is None
+                or not np.isfinite(result).all()
+                or result.max() < 1e-5
+            ):
+                result = apply_pipeline_cpu(self._image, self._params, quality="final")
         except Exception as exc:  # pragma: no cover - runtime safeguard
             print("[FullRenderWorker] render error:", exc)
             return
@@ -1206,6 +1788,12 @@ class TileRenderTask(QRunnable):
         try:
             tile = _extract_tile(self.base_level, self.tile_key, self.tile_size)
             result = apply_pipeline(tile, self.params, quality=self.quality)
+            if (
+                result is None
+                or not np.isfinite(result).all()
+                or result.max() < 1e-5
+            ):
+                result = apply_pipeline_cpu(tile, self.params, quality=self.quality)
         except Exception as exc:  # pragma: no cover - runtime safeguard
             print("[TileRenderTask] render error:", exc)
             return
@@ -1302,6 +1890,108 @@ class TitleBar(QWidget):
         self.window().close()
 
 
+class DebugOverlay(QWidget):
+    """Lightweight overlay that graphs frame times and render stats."""
+
+    def __init__(self, parent=None, history: int = 240):
+        super().__init__(parent)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self.setAttribute(Qt.WA_NoSystemBackground, True)
+        self.setAutoFillBackground(False)
+        self._frame_ms_history: deque[float] = deque(maxlen=history)
+        self._fps_history: deque[float] = deque(maxlen=history)
+        self._last_fps: float = 0.0
+        self._last_ms: float = 0.0
+        self._meta: dict = {}
+        self.setFixedSize(260, 150)
+
+    def update_metrics(self, fps: float, frame_ms: float, meta: dict | None = None):
+        self._last_fps = fps
+        self._last_ms = frame_ms
+        self._frame_ms_history.append(frame_ms if frame_ms >= 0 else 0.0)
+        self._fps_history.append(max(0.0, fps))
+        self._meta = meta or {}
+        self.update()
+
+    def paintEvent(self, event):  # noqa: N802
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        rect = self.rect()
+
+        painter.fillRect(rect, QColor(12, 12, 12, 210))
+
+        margin = 10
+        text_color = QColor(220, 230, 240)
+        accent = QColor(80, 170, 255)
+        warn = QColor(255, 140, 80)
+
+        fps_avg = sum(self._fps_history) / len(self._fps_history) if self._fps_history else 0.0
+        frame_p95 = 0.0
+        if self._frame_ms_history:
+            frame_p95 = float(np.percentile(list(self._frame_ms_history), 95))
+
+        lines = [
+            f"FPS: {self._last_fps:5.1f} (avg {fps_avg:4.1f})",
+            f"Frame: {self._last_ms:5.1f} ms (p95 {frame_p95:4.1f} ms)",
+        ]
+        if self._meta:
+            tiles = f"{self._meta.get('tiles_inflight', 0)}/{self._meta.get('tile_cache', 0)}"
+            zoom_desc = self._meta.get("zoom_desc", "")
+            level = self._meta.get("preview_level", 0)
+            threads = self._meta.get("render_threads", 0)
+            lines.append(f"Tiles inflight/cache: {tiles} | threads: {threads}")
+            lines.append(f"Preview L{level} @ {zoom_desc}")
+
+        painter.setPen(text_color)
+        y = margin + painter.fontMetrics().ascent()
+        for line in lines:
+            painter.drawText(margin, y, line)
+            y += painter.fontMetrics().height() + 2
+
+        graph_top = y + 6
+        graph_rect = QRect(
+            margin,
+            graph_top,
+            max(10, rect.width() - 2 * margin),
+            max(12, rect.height() - graph_top - margin),
+        )
+
+        # Graph background
+        painter.fillRect(graph_rect, QColor(30, 30, 30, 190))
+        painter.setPen(QColor(70, 70, 70))
+        painter.drawRect(graph_rect)
+
+        if not self._frame_ms_history:
+            return
+
+        max_ms = max(16.0, max(self._frame_ms_history))
+        graph_bottom = graph_rect.bottom()
+        graph_height = graph_rect.height()
+        graph_left = graph_rect.left()
+        graph_right = graph_rect.right()
+
+        for ref_ms, color in [(16.6, accent), (33.3, warn)]:
+            y_ref = graph_bottom - int(min(1.0, ref_ms / max_ms) * graph_height)
+            painter.setPen(QColor(color.red(), color.green(), color.blue(), 120))
+            painter.drawLine(graph_left, y_ref, graph_right, y_ref)
+            painter.drawText(graph_left + 2, y_ref - 2, f"{ref_ms:.0f} ms")
+
+        painter.setPen(accent)
+        values = list(self._frame_ms_history)
+        n = len(values)
+        prev_x = prev_y = None
+        for idx, ms in enumerate(values):
+            if n == 1:
+                x = graph_left
+            else:
+                x = graph_left + int(idx * (graph_rect.width()) / max(1, n - 1))
+            y_val = graph_bottom - int(min(1.0, ms / max_ms) * graph_height)
+            y_val = max(graph_rect.top(), min(graph_rect.bottom(), y_val))
+            if prev_x is not None:
+                painter.drawLine(prev_x, prev_y, x, y_val)
+            prev_x, prev_y = x, y_val
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -1311,6 +2001,7 @@ class MainWindow(QMainWindow):
         self.setWindowIcon(QIcon("icon.ico"))
         self.resize(1200, 800)
         self.setMinimumSize(600, 400)
+        self._adjust_popups: dict[str, QDialog] = {}
 
         central = QWidget(self)
         self.setCentralWidget(central)
@@ -1357,7 +2048,7 @@ class MainWindow(QMainWindow):
         self._display_scale: float = 1.0
         self._preview_level = 0
 
-        self._image_cache: dict[str, dict] = {}   # path -> {"linear_full": np.ndarray, "preview_linear": np.ndarray}
+        self._image_cache: dict[str, dict] = {}   # path -> {"linear_full": np.ndarray, "preview_source": np.ndarray, "preview_linear": np.ndarray}
         self._image_params: dict[str, dict] = {}  # path -> params
         self._image_parents: dict[str, QTreeWidgetItem] = {}
         self._edits: dict[str, dict] = {}         # for project export
@@ -1368,6 +2059,16 @@ class MainWindow(QMainWindow):
 
         # performance caps
         self._max_thumb_inflight = 32
+
+        # Debug / perf overlay
+        self._debug_overlay_enabled = False
+        self._debug_overlay: DebugOverlay | None = None
+        self._last_frame_present_time: float | None = None
+        self._last_paint_time: float | None = None
+        self._debug_start_time: float | None = None
+        self._perf_log: list[tuple[float, float, float]] = []  # (t, fps, ms)
+        self._perf_log_max = 12000
+        self._debug_log_path: str | None = None
 
         # fullscreen state defaults
         self._is_fullscreen_mode = False
@@ -1388,6 +2089,7 @@ class MainWindow(QMainWindow):
 
         # current parameters (Light + Color tabs)
         self._color_defaults = default_color_params()
+        self._geometry_defaults = copy.deepcopy(_dict_to_geometry_params(None).__dict__)
         self._current_params = {
             "exposure": 128,
             "contrast": 128,
@@ -1445,6 +2147,9 @@ class MainWindow(QMainWindow):
             "normal_intensity": 100,
             "normal_specular": 0,
             "normal_diffuse": 100,
+            "view_exposure_bias": 0.0,
+            "output_transform": OutputTransformMode.STANDARD.value,
+            "geometry": copy.deepcopy(self._geometry_defaults),
         }
         for _color in ["red", "orange", "yellow", "green", "aqua", "blue", "purple", "magenta"]:
             self._current_params.update({
@@ -1483,6 +2188,11 @@ class MainWindow(QMainWindow):
         self._tile_render_timer.setSingleShot(True)
         self._tile_render_timer.timeout.connect(self._start_background_tiles)
 
+        # Debug heartbeat so overlay keeps updating even when no new frames are painted
+        self._debug_timer = QTimer(self)
+        self._debug_timer.setInterval(16)  # ~60 Hz virtual frame updates while idle
+        self._debug_timer.timeout.connect(self._on_debug_heartbeat)
+
         # Render caches (reset per image)
         self._reset_render_cache()
 
@@ -1502,6 +2212,10 @@ class MainWindow(QMainWindow):
         self.image_scroll.setAlignment(Qt.AlignCenter)
         self.image_scroll.horizontalScrollBar().valueChanged.connect(lambda _: self._schedule_background_tiles(0))
         self.image_scroll.verticalScrollBar().valueChanged.connect(lambda _: self._schedule_background_tiles(0))
+
+        # Debug overlay lives on top of the viewport so it scrolls with the image area
+        self._debug_overlay = DebugOverlay(self.image_scroll.viewport())
+        self._debug_overlay.hide()
 
         # Preview/zoom toolbar
         self.image_toolbar = QWidget()
@@ -1637,6 +2351,11 @@ class MainWindow(QMainWindow):
 
     # NEW unified adjustments panel
         self.adjust_panel = AdjustmentsPanel(self)
+        # Compact typography and padding within the right dock to reduce overflow risk.
+        self.adjust_panel.setStyleSheet(
+            "#adjustmentsRoot { font-size: 12px; }"
+            "#adjustmentsRoot QLabel { min-width: 0px; }"
+        )
         self.right_dock.setWidget(self.adjust_panel)
         self.hist_dock.setWidget(self.hist_widget)
 
@@ -1761,6 +2480,171 @@ class MainWindow(QMainWindow):
         self._render_version += 1
         self._full_render_token += 1
         self._drag_preview_mode = False
+
+    def _update_debug_overlay_geometry(self):
+        if not self._debug_overlay:
+            return
+        parent = self.image_scroll.viewport() if hasattr(self, "image_scroll") else None
+        if parent is None:
+            return
+        margin = 12
+        w = self._debug_overlay.width()
+        h = self._debug_overlay.height()
+        x = max(margin, parent.width() - w - margin)
+        y = margin
+        self._debug_overlay.setGeometry(x, y, w, h)
+        self._debug_overlay.raise_()
+
+    def _debug_overlay_zoom_text(self) -> str:
+        zoom_mode = getattr(self, "_zoom_mode", "fit")
+        if zoom_mode == "fit":
+            pct = int(round(getattr(self, "_display_scale", 1.0) * 100))
+            return f"{pct}% (fit)"
+        return f"{getattr(self, '_zoom_factor', 1.0):.2f}x"
+
+    def _set_debug_overlay_enabled(self, enabled: bool):
+        self._debug_overlay_enabled = bool(enabled)
+        if not self._debug_overlay:
+            return
+        if self._debug_overlay_enabled:
+            self._last_frame_present_time = time.perf_counter()
+            self._last_paint_time = self._last_frame_present_time
+            self._debug_start_time = self._last_frame_present_time
+            self._debug_overlay._frame_ms_history.clear()
+            self._debug_overlay._fps_history.clear()
+            self._perf_log.clear()
+            self._debug_log_path = None
+            self._update_debug_overlay_geometry()
+            self._debug_overlay.show()
+            self._debug_overlay.raise_()
+            self._debug_timer.start()
+        else:
+            self._debug_timer.stop()
+            self._debug_overlay.hide()
+
+    def _debug_overlay_meta(self) -> dict:
+        pool = getattr(self, "_render_pool", None)
+        return {
+            "tiles_inflight": len(getattr(self, "_tile_tasks_inflight", [])),
+            "tile_cache": len(getattr(self, "_tile_cache", {})),
+            "render_threads": pool.activeThreadCount() if pool else 0,
+            "preview_level": getattr(self, "_preview_level", 0),
+            "zoom_desc": self._debug_overlay_zoom_text(),
+        }
+
+    def _record_perf_sample(self, fps: float, frame_ms: float):
+        if self._debug_start_time is None:
+            self._debug_start_time = time.perf_counter()
+        t = time.perf_counter() - self._debug_start_time
+        self._perf_log.append((t, fps, frame_ms))
+        if len(self._perf_log) > self._perf_log_max:
+            # Simple decimation to keep memory bounded
+            self._perf_log = self._perf_log[len(self._perf_log) - self._perf_log_max :]
+
+    def _save_perf_graph(self):
+        if not self._perf_log:
+            return
+        try:
+            w = 1200
+            h = 320
+            margin = 30
+            img = QImage(w, h, QImage.Format_ARGB32_Premultiplied)
+            painter = QPainter(img)
+            painter.fillRect(img.rect(), QColor(12, 12, 12, 240))
+
+            accent = QColor(80, 170, 255)
+            warn = QColor(255, 140, 80)
+            grid = QColor(70, 70, 70, 140)
+            text = QColor(230, 230, 230)
+
+            # Axes
+            painter.setPen(grid)
+            painter.drawRect(margin, margin, w - 2 * margin, h - 2 * margin)
+
+            data = list(self._perf_log)
+            times = [s[0] for s in data]
+            frame_ms_vals = [s[2] for s in data]
+            if not times or not frame_ms_vals:
+                painter.end()
+                return
+
+            t_min, t_max = min(times), max(times)
+            t_span = max(0.001, t_max - t_min)
+            max_ms = max(16.0, max(frame_ms_vals), 33.3)
+
+            plot_w = w - 2 * margin
+            plot_h = h - 2 * margin
+            x0 = margin
+            y0 = margin
+
+            # Reference lines
+            for ref_ms, color in [(16.6, accent), (33.3, warn)]:
+                y = y0 + int((1.0 - min(ref_ms / max_ms, 1.0)) * plot_h)
+                painter.setPen(QColor(color.red(), color.green(), color.blue(), 120))
+                painter.drawLine(x0, y, x0 + plot_w, y)
+                painter.setPen(text)
+                painter.drawText(x0 + 4, y - 2, f"{ref_ms:.1f} ms")
+
+            # Downsample to fit width
+            stride = max(1, int(len(data) / plot_w))
+            painter.setPen(accent)
+            prev_pt = None
+            for idx in range(0, len(data), stride):
+                t, fps, ms = data[idx]
+                x = x0 + int(((t - t_min) / t_span) * plot_w)
+                y = y0 + int((1.0 - min(ms / max_ms, 1.0)) * plot_h)
+                y = max(y0, min(y0 + plot_h, y))
+                if prev_pt is not None:
+                    painter.drawLine(prev_pt[0], prev_pt[1], x, y)
+                prev_pt = (x, y)
+
+            # Labels
+            painter.setPen(text)
+            painter.drawText(
+                margin,
+                h - 8,
+                f"FPS graph ({len(self._perf_log)} samples, duration {t_span:.1f}s)",
+            )
+
+            painter.end()
+
+            tmp_dir = tempfile.gettempdir()
+            fname = f"gradience_fps_log_{int(time.time())}.png"
+            out_path = os.path.join(tmp_dir, fname)
+            img.save(out_path, "PNG")
+            self._debug_log_path = out_path
+        except Exception:
+            self._debug_log_path = None
+
+    def _update_debug_overlay_metrics(self, fps: float, frame_ms: float):
+        self._record_perf_sample(fps, frame_ms)
+        if not (self._debug_overlay_enabled and self._debug_overlay and self._debug_overlay.isVisible()):
+            return
+        self._debug_overlay.update_metrics(fps, frame_ms, self._debug_overlay_meta())
+
+    def _mark_frame_presented(self):
+        now = time.perf_counter()
+        frame_ms = 0.0
+        fps = 0.0
+        if self._last_paint_time is not None:
+            dt = now - self._last_paint_time
+            if dt > 0:
+                frame_ms = dt * 1000.0
+                fps = 1.0 / dt
+        self._last_paint_time = now
+        self._last_frame_present_time = now
+        self._update_debug_overlay_metrics(fps, frame_ms)
+
+    def _on_debug_heartbeat(self):
+        if not (self._debug_overlay_enabled and self._debug_overlay and self._debug_overlay.isVisible()):
+            return
+        interval_ms = float(self._debug_timer.interval())
+        if interval_ms <= 0:
+            return
+        self._last_frame_present_time = time.perf_counter()
+        frame_ms = interval_ms
+        fps = 1000.0 / interval_ms
+        self._update_debug_overlay_metrics(fps, frame_ms)
 
     def _update_header_filename(self, path: str | None):
         """Update header filename label without altering core logic."""
@@ -2057,6 +2941,51 @@ class MainWindow(QMainWindow):
             return
         self._set_zoom(1.0, mode="manual")
 
+    # ---------- pop-out adjustment windows ----------
+
+    def _open_adjust_window(self, kind: str, title: str, section: str | None = None):
+        """Open a floating window that mirrors the right-dock panels."""
+        existing = self._adjust_popups.get(kind)
+        if existing and existing.isVisible():
+            if section and hasattr(existing, "_panel"):
+                panel = existing._panel
+                if hasattr(panel, "show_only_section"):
+                    panel.show_only_section(section)
+                elif hasattr(panel, "expand_section"):
+                    panel.expand_section(section)
+            existing.raise_()
+            existing.activateWindow()
+            return
+
+        widget_cls = {
+            "levels": LightGroupWidget,
+            "color": ColorGroupWidget,
+            "detail": ToneGroupWidget,
+            "fx": FXGroupWidget,
+        }.get(kind)
+        if widget_cls is None:
+            return
+
+        dlg = QDialog(self)
+        dlg.setAttribute(Qt.WA_DeleteOnClose)
+        dlg.setWindowTitle(title)
+        dlg.setMinimumWidth(420)
+        layout = QVBoxLayout(dlg)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(6)
+        panel = widget_cls(self, dlg)
+        dlg._panel = panel  # type: ignore[attr-defined]
+        layout.addWidget(panel)
+        if section and hasattr(panel, "show_only_section"):
+            panel.show_only_section(section)
+        elif section and hasattr(panel, "expand_section"):
+            panel.expand_section(section)
+        self._adjust_popups[kind] = dlg
+        dlg.finished.connect(lambda _: self._adjust_popups.pop(kind, None))
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
+
 
     def _build_menus(self):
         # Gradience Studio (app) menu
@@ -2086,6 +3015,29 @@ class MainWindow(QMainWindow):
         self.act_save_project = file_menu.addAction("&Save Project")
         self.act_save_project.setShortcut("Ctrl+S")
         self.act_save_project.triggered.connect(self.export_lrc)
+
+        # Quick access adjustment menus
+        adjust_menus = [
+            ("&Levels", "levels", "Levels Panel", [
+                "Levels", "White Balance", "Brightness / Contrast", "Exposure", "Shadows / Highlights", "Vibrance", "Posterize",
+            ]),
+            ("C&olor", "color", "Color Panel", [
+                "HSL", "Recolor", "Black & White", "Selective Color", "Color Balance", "White Balance",
+            ]),
+            ("&Detail", "detail", "Detail Panel", [
+                "Parametric Curve", "Point Curve Editor", "Channel Mixer", "Gradient Map", "Split Toning", "Normals",
+            ]),
+            ("F&X", "fx", "FX Panel", ["Lens Filter"]),
+        ]
+        for label, key, title, sections in adjust_menus:
+            menu = self.menuBar().addMenu(label)
+            if sections:
+                for sect in sections:
+                    act = menu.addAction(sect)
+                    act.triggered.connect(lambda checked=False, k=key, t=title, s=sect: self._open_adjust_window(k, t, s))
+                menu.addSeparator()
+            panel_action = menu.addAction(f"Open {title}")
+            panel_action.triggered.connect(lambda checked=False, k=key, t=title: self._open_adjust_window(k, t))
 
         
 
@@ -2199,6 +3151,8 @@ class MainWindow(QMainWindow):
         gs_magenta = "#C12AFF"
         gs_orange = "#FF7A2F"
         grad = f"stop:0 {gs_blue}, stop:0.25 {gs_indigo}, stop:0.5 {gs_purple}, stop:0.75 {gs_magenta}, stop:1 {gs_orange}"
+        grad_start = gs_blue
+        grad_end = gs_orange
         # embed a tiny checkmark so we never depend on external icon files
         check_icon_css = f"""
             border: 1px solid {ui_border};
@@ -2435,7 +3389,7 @@ class MainWindow(QMainWindow):
             background-color: {ui_panel_bg};
         }}
         HistogramWidget, QWidget#histogramPanel, HistogramWidget#histogramPanel {{
-            background-color: {ui_tray_bg};
+            background-color: #000000;
             border: 1px solid {ui_border};
             border-radius: 4px;
             min-height: 120px;
@@ -2465,6 +3419,8 @@ class MainWindow(QMainWindow):
         }}
         QPushButton#sectionHeaderButton:checked {{
             background-color: {ui_control_bg};
+            border-color: transparent;
+            border-image: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 {grad_start}, stop:1 {grad_end}) 1;
         }}
         QWidget#sectionContent {{
             background-color: {ui_panel_bg};
@@ -2776,7 +3732,7 @@ class MainWindow(QMainWindow):
                     self.thumbs.setCurrentItem(item)
                     self._on_thumbnail_clicked(item)
 
-    # ---------- metadata helpers ----------
+# ---------- metadata helpers ----------
     def _read_exif_for_path(self, path: str):
         """
         Return a dict with a few EXIF fields we care about:
@@ -2789,6 +3745,7 @@ class MainWindow(QMainWindow):
             "shutter": None,
             "ev": None,
             "focal": None,
+            "lens_name": None,
         }
 
         try:
@@ -2867,6 +3824,16 @@ class MainWindow(QMainWindow):
             except Exception:
                 exif_info["focal"] = str(fl)
 
+        # Lens name
+        lens_name = data.get("LensModel") or data.get("LensMake")
+        if not lens_name:
+            lm = data.get("Make", "")
+            camera = data.get("Model", "")
+            fl = exif_info.get("focal")
+            if lm or camera or fl:
+                lens_name = " ".join([str(x) for x in [lm, camera, fl] if x])
+        exif_info["lens_name"] = lens_name or None
+
         return exif_info
 
 
@@ -2916,7 +3883,7 @@ class MainWindow(QMainWindow):
         self._set_metadata_field("filesize", f"{size_mb:.1f} MB" if size_mb else "—")
         self._set_metadata_field("modified", modified_str)
 
-                # --- EXIF fields (ISO, aperture, shutter, EV, focal length) ---
+        # --- EXIF fields (ISO, aperture, shutter, EV, focal length) ---
         exif = self._read_exif_for_path(path)
 
 
@@ -2930,6 +3897,15 @@ class MainWindow(QMainWindow):
             self._metadata_labels["ev"].setText(exif["ev"] or "—")
         if "focal" in self._metadata_labels:
             self._metadata_labels["focal"].setText(exif["focal"] or "—")
+
+        # Lens profile detection
+        lens_name = exif.get("lens_name") or ""
+        geom = self._current_params.get("geometry") or {}
+        if isinstance(geom, dict):
+            geom["lens_profile_name"] = lens_name
+        self._current_params["geometry"] = geom
+        if hasattr(self, "adjust_panel") and getattr(self.adjust_panel, "geometry_group", None):
+            self.adjust_panel.geometry_group.update_detected_lens(lens_name)
 
 
     # ---------- histogram update ----------
@@ -3072,6 +4048,20 @@ class MainWindow(QMainWindow):
         thumb_inflight_spin.setValue(getattr(self, "_max_thumb_inflight", 32))
         layout.addRow("Max concurrent thumbnails:", thumb_inflight_spin)
 
+        debug_chk = QCheckBox("Enable debug overlay (FPS graph)", dlg)
+        debug_chk.setChecked(getattr(self, "_debug_overlay_enabled", False))
+        layout.addRow(debug_chk)
+
+        cuda_basic_chk = QCheckBox("Use CUDA for adjustments (if available)", dlg)
+        cuda_basic_chk.setChecked(get_cuda_basic_enabled())
+        cuda_basic_chk.setEnabled(_CUDA_AVAILABLE)
+        layout.addRow(cuda_basic_chk)
+
+        cuda_sharp_chk = QCheckBox("Use CUDA for sharpening (if available)", dlg)
+        cuda_sharp_chk.setChecked(get_cuda_sharpen_enabled())
+        cuda_sharp_chk.setEnabled(_CUDA_AVAILABLE)
+        layout.addRow(cuda_sharp_chk)
+
         cuda_thumb_chk = QCheckBox("Use CUDA for thumbnail scaling (if available)", dlg)
         cuda_thumb_chk.setChecked(get_cuda_thumbs_enabled())
         layout.addRow(cuda_thumb_chk)
@@ -3103,6 +4093,9 @@ class MainWindow(QMainWindow):
 
             self._max_thumb_inflight = thumb_inflight_spin.value()
 
+            self._set_debug_overlay_enabled(debug_chk.isChecked())
+            set_cuda_basic_enabled(cuda_basic_chk.isChecked())
+            set_cuda_sharpen_enabled(cuda_sharp_chk.isChecked())
             set_cuda_thumbs_enabled(cuda_thumb_chk.isChecked())
 
     # ---------- new project ----------
@@ -3330,15 +4323,17 @@ class MainWindow(QMainWindow):
         if not cache:
             return
 
-        linear_full = cache.get("linear_full")
-        if linear_full is None:
+        preview_base = cache.get("preview_source")
+        if preview_base is None:
+            preview_base = cache.get("linear_full")
+        if preview_base is None:
             return
 
         scale = max(0.0, float(self._preview_scale or 1.0))
         if scale >= 0.999:
-            preview_linear = linear_full
+            preview_linear = preview_base
         else:
-            preview_linear = self._resample_linear_preview(linear_full, scale)
+            preview_linear = self._resample_linear_preview(preview_base, scale)
 
         cache["preview_linear"] = preview_linear
 
@@ -3421,19 +4416,31 @@ class MainWindow(QMainWindow):
         cache = self._image_cache.get(path)
         if cache is not None:
             # If preview is missing (e.g. after we changed scale), rebuild it
-            if "preview_linear" not in cache:
+            if "preview_linear" not in cache or cache.get("preview_linear") is None:
                 self._rebuild_preview_for_path(path)
             return
 
-        linear = _load_linear_image(path)
-        if linear is None:
+        linear_full = _load_image_full_linear(path)
+        preview_src = _load_image_preview_linear(path)
+        if preview_src is None:
+            preview_src = linear_full
+        if linear_full is None and preview_src is None:
             return
 
-        self._image_cache[path] = {"linear_full": linear}
-        self._rebuild_preview_for_path(path)
+        cache_entry = {
+            "linear_full": linear_full if linear_full is not None else preview_src,
+            "preview_source": preview_src,
+        }
 
+        src_for_preview = preview_src if preview_src is not None else linear_full
+        if src_for_preview is not None:
+            scale = max(0.0, float(getattr(self, "_preview_scale", 1.0) or 1.0))
+            if scale >= 0.999:
+                cache_entry["preview_linear"] = src_for_preview
+            else:
+                cache_entry["preview_linear"] = self._resample_linear_preview(src_for_preview, scale)
 
-
+        self._image_cache[path] = cache_entry
 
 
     def _show_image_version(self, path: str, params: dict, update_sliders: bool = False):
@@ -3449,7 +4456,15 @@ class MainWindow(QMainWindow):
         if self._base_image is None:
             return
 
-        self._build_mipmaps(self._base_image)
+        cached_mips = cache.get("mipmaps")
+        cached_scales = cache.get("mip_scales")
+        if cached_mips and cached_scales:
+            self._mipmaps = cached_mips
+            self._mip_scales = cached_scales
+        else:
+            self._build_mipmaps(self._base_image)
+            cache["mipmaps"] = self._mipmaps
+            cache["mip_scales"] = self._mip_scales
 
         if "preview_linear" not in cache or cache.get("preview_linear") is None:
             cache["preview_linear"] = self._resample_linear_preview(self._base_image, self._preview_scale)
@@ -3485,8 +4500,16 @@ class MainWindow(QMainWindow):
                 "levels_color_model": get("levels_color_model", "RGB"),
                 "levels_channel": get("levels_channel", "Master"),
                 "levels_linear": get("levels_linear", False),
+                "view_exposure_bias": get("view_exposure_bias", 0.0),
             }
         )
+        ot_val = params.get("output_transform", self._current_params.get("output_transform", OutputTransformMode.STANDARD.value))
+        if isinstance(ot_val, OutputTransformMode):
+            ot_val = ot_val.value
+        self._current_params["output_transform"] = str(ot_val or OutputTransformMode.STANDARD.value)
+        geom_dict = copy.deepcopy(self._geometry_defaults)
+        geom_dict.update(params.get("geometry", {}))
+        self._current_params["geometry"] = geom_dict
         color_state = merge_color_params(params.get("color"), params)
         self._current_params["color"] = color_state
         for _color in ["red", "orange", "yellow", "green", "aqua", "blue", "purple", "magenta"]:
@@ -3497,6 +4520,17 @@ class MainWindow(QMainWindow):
             self._current_params[f"hsl_hue_{_color}"] = hue_map.get(_color, get(f"hsl_hue_{_color}", 0))
             self._current_params[f"hsl_sat_{_color}"] = sat_map.get(_color, get(f"hsl_sat_{_color}", 0))
             self._current_params[f"hsl_lum_{_color}"] = lum_map.get(_color, get(f"hsl_lum_{_color}", 0))
+
+        try:
+            if hasattr(self, "adjust_panel") and hasattr(self.adjust_panel, "fx_group"):
+                combo = getattr(self.adjust_panel.fx_group, "output_combo", None)
+                if combo is not None:
+                    combo.blockSignals(True)
+                    mode_lower = str(self._current_params.get("output_transform", OutputTransformMode.STANDARD.value)).lower()
+                    combo.setCurrentIndex(1 if mode_lower == "filmic" else 0)
+                    combo.blockSignals(False)
+        except Exception:
+            pass
 
         self._active_edit = self._ensure_active_edit_tree(path)
 
@@ -3632,6 +4666,7 @@ class MainWindow(QMainWindow):
         self.image_display.resize(self._current_pixmap.size())
         self.image_display.setText("")
         self._update_zoom_label()
+        self._mark_frame_presented()
 
     def _update_display_from_qimage(self, qimg: QImage):
         """Store a new preview qimage and composite it with any available tiles."""
@@ -3652,7 +4687,10 @@ class MainWindow(QMainWindow):
             self._build_mipmaps(self._base_image)
 
         if self._mipmaps:
-            if force_smallest:
+            geometry_active = not _geometry_is_identity(_dict_to_geometry_params(self._current_params.get("geometry")))
+            if geometry_active:
+                level_idx = 0  # force highest quality when geometry is active to avoid blocky previews
+            elif force_smallest:
                 level_idx = len(self._mipmaps) - 1  # smallest mip for fastest slider drag preview
             else:
                 level_idx = self._choose_preview_mip()
@@ -3666,9 +4704,18 @@ class MainWindow(QMainWindow):
         if base is None:
             return
 
+        # Downscale preview via OpenCV and force CPU pipeline for interactivity
         self._preview_base_linear = base
         params = self._current_edit_params()
-        result = apply_pipeline(base, params, quality="preview")
+        bh, bw = base.shape[:2]
+        max_preview = 2048
+        scale = min(1.0, max_preview / max(bh, bw)) if max(bh, bw) > 0 else 1.0
+        preview_img = base
+        if scale < 0.999:
+            new_w = max(1, int(bw * scale))
+            new_h = max(1, int(bh * scale))
+            preview_img = cv2.resize(base, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        result = apply_pipeline_cpu(preview_img, params, quality="preview")
         if result is None:
             return
 
@@ -3696,6 +4743,10 @@ class MainWindow(QMainWindow):
 
     def _schedule_background_tiles(self, delay_ms: int = 150):
         """Debounce tile rendering so we don't flood the pool during slider drags."""
+        # When geometry is active, skip tile rendering to avoid misaligned tiles; rely on preview + full render.
+        if not _geometry_is_identity(self._current_params.get("geometry")):
+            self._tile_render_timer.stop()
+            return
         self._tile_render_timer.stop()
         self._tile_render_timer.start(delay_ms)
 
@@ -3753,6 +4804,8 @@ class MainWindow(QMainWindow):
 
     def _start_background_tiles(self):
         """Submit visible tiles to the render pool in priority order."""
+        if not _geometry_is_identity(self._current_params.get("geometry")):
+            return
         if self._shutting_down or not self._mipmaps:
             return
         if self._preview_qimage is None:
@@ -3819,6 +4872,7 @@ class MainWindow(QMainWindow):
         self._current_pixmap = QPixmap.fromImage(self._display_qimage)
         self.image_display.setPixmap(self._current_pixmap)
         self.image_display.update()
+        self._mark_frame_presented()
 
     def _schedule_preview_render(self):
         """Debounce rendering so rapid slider moves don't re-render every tick."""
@@ -3929,6 +4983,7 @@ class MainWindow(QMainWindow):
         self.image_display.resize(scaled.size())
         self.image_display.setText("")
         self._update_zoom_label()
+        self._mark_frame_presented()
 
 
     # ---------- Thumbnail / folder handling ----------
@@ -4027,6 +5082,7 @@ class MainWindow(QMainWindow):
         if self._current_pixmap is not None and self._zoom_mode == "fit":
             self._rescale_preview()
             self._schedule_background_tiles(0)
+        self._update_debug_overlay_geometry()
         self._ensure_visible_thumbs()
 
 
@@ -4064,6 +5120,12 @@ class MainWindow(QMainWindow):
         self._full_render_timer.stop()
         self._idle_mip_timer.stop()
         self._tile_render_timer.stop()
+        try:
+            self._save_perf_graph()
+            if self._debug_log_path:
+                self.statusBar().showMessage(f"Saved FPS log to {self._debug_log_path}", 4000)
+        except Exception:
+            pass
         return super().closeEvent(event)
 
 

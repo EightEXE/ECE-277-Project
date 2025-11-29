@@ -17,8 +17,17 @@ from PySide6.QtWidgets import (
 )
 from PIL import Image
 
-from .constants import IMAGE_EXTENSIONS
-from .utils import load_qimage_any
+# Support running as a module and as a standalone script for debugging.
+if __package__:
+    from .constants import IMAGE_EXTENSIONS
+    from .utils import load_image_thumbnail_qimage
+else:  # pragma: no cover - convenience for direct execution
+    import sys
+    from pathlib import Path
+
+    sys.path.append(str(Path(__file__).resolve().parent.parent))
+    from lightroom_clone.constants import IMAGE_EXTENSIONS  # type: ignore
+from lightroom_clone.utils import load_image_thumbnail_qimage  # type: ignore
 
 # Optional CUDA for thumbnail scaling
 try:
@@ -89,7 +98,7 @@ class CollapsibleSection(QWidget):
         self._content = QWidget()
         self._content.setObjectName("sectionContent")
         self._content_layout = QVBoxLayout(self._content)
-        self._content_layout.setContentsMargins(10, 4, 10, 8)
+        self._content_layout.setContentsMargins(4, 3, 4, 6)
         self._content_layout.setSpacing(4)
 
         layout = QVBoxLayout(self)
@@ -177,7 +186,7 @@ class HistogramWidget(QWidget):
         painter.setRenderHint(QPainter.Antialiasing, False)
 
         # Neutral panel background for histogram frame
-        painter.fillRect(self.rect(), QColor(36, 36, 36))
+        painter.fillRect(self.rect(), QColor(0, 0, 0))
 
         r = self.rect().adjusted(6, 6, -6, -6)
         painter.setPen(QPen(QColor(58, 58, 58)))
@@ -291,7 +300,7 @@ class _ThumbTask(QRunnable):
                 # Corrupt or unsupported images should silently fall back to CPU path
                 use_cuda = False
 
-        img = load_qimage_any(self.path)
+        img = load_image_thumbnail_qimage(self.path)
         if img is not None:
             # build a mip-like downscale before final quality resize
             try:
