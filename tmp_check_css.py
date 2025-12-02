@@ -1,13 +1,3 @@
-import base64, os
-from pathlib import Path
-bundle_root = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath('lightroom_clone/main_window.py')), '..'))
-icon_path = os.path.normpath(os.path.join(bundle_root, 'icons', 'check.png'))
-check_icon_css = ''
-try:
-    with open(icon_path, 'rb') as f:
-        encoded = base64.b64encode(f.read()).decode('ascii')
-    check_icon_css = f'image: url("data:image/png;base64,{encoded}");'
-except Exception as exc:
-    print('err', exc)
-print(len(check_icon_css))
-print(check_icon_css[:80])
+version https://git-lfs.github.com/spec/v1
+oid sha256:4fe0ab7adf62569e100d30138869c2722d667491b2c5b309bf9a75605ab1f142
+size 536

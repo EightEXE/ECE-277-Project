@@ -1,0 +1,17 @@
+# Python / bytecode
+__pycache__/
+*.pyc
+
+# Virtual envs
+venv/
+.venv/
+
+# Build / dist artifacts
+build/
+dist/
+
+# Big binaries
+*.exe
+*.dll
+*.pyd
+*.pkg
